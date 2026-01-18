@@ -992,7 +992,7 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
     - Comportamiento actual (clustering automático)
     - Mantiene toda la funcionalidad existente
     """
-    from utils.analytics import analytics
+    # from utils.analytics import analytics  # TODO: Implementar módulo analytics
     
     start_time = time_module.time()
     
@@ -1242,13 +1242,13 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
         
         for attempt in range(max_retries):
             try:
-                analytics.track_request("hybrid_itinerary_v31", {
-                    "places_count": len(normalized_places),
-                    "hotels_provided": hotels_provided,
-                    "days_requested": (end_date - start_date).days + 1,
-                    "transport_mode": request.transport_mode,
-                    "attempt": attempt + 1
-                })
+                # analytics.track_request("hybrid_itinerary_v31", {
+                #     "places_count": len(normalized_places),
+                #     "hotels_provided": hotels_provided,
+                #     "days_requested": (end_date - start_date).days + 1,
+                #     "transport_mode": request.transport_mode,
+                #     "attempt": attempt + 1
+                # })
                 
                 # Pasar información extra al optimizer
                 extra_info = {
@@ -1405,10 +1405,15 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
         # Contar actividades totales
         total_activities = sum(len(day.get("activities", [])) for day in days_data)
         
+        # Inicializar diccionario de sugerencias para días libres
+        suggestions_by_date = {}
 
         
         # Determinar el modo de optimización usado
         optimization_mode = "hotel_centroid" if hotels_provided else "geographic_clustering"
+        
+        # 🧠 OBTENER INFORMACIÓN SEMÁNTICA GLOBAL
+        semantic_info = get_semantic_status()
         
         # Formatear respuesta inteligente basada en el modo usado
         base_recommendations = []
@@ -2236,8 +2241,8 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
                     
                     logger.info(f"📍 Generando sugerencias para {day_date} ({day_type})")
                     
-                    # Generar 3-5 sugerencias por día libre
-                    place_types = ["tourist_attraction", "museum", "park", "restaurant"]
+                    # Generar 3-5 sugerencias por día libre (sin restaurantes)
+                    place_types = ["tourist_attraction", "museum", "park", "art_gallery", "shopping_mall", "point_of_interest"]
                     day_suggestions = []
                     
                     for place_type in place_types:
@@ -2251,6 +2256,15 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
                             )
                             
                             for suggestion in suggestions[:2]:  # Max 2 por tipo
+                                # Filtrar restaurantes y hoteles explícitamente
+                                suggestion_type = suggestion.get("type", "").lower()
+                                suggestion_category = suggestion.get("category", "").lower()
+                                
+                                # Excluir si es restaurante, hotel o accommodation
+                                if any(excluded in suggestion_type or excluded in suggestion_category 
+                                       for excluded in ["restaurant", "cafe", "food", "hotel", "accommodation", "lodging"]):
+                                    continue
+                                
                                 day_suggestions.append({
                                     "name": suggestion.get("name", "Lugar sugerido"),
                                     "rating": suggestion.get("rating", 4.0),
@@ -2303,15 +2317,15 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
                 )
         
         # Log success
-        analytics.track_request(f"hybrid_itinerary_{optimization_mode}_success", {
-            "efficiency_score": optimization_result.get("optimization_metrics", {}).get("efficiency_score", 0.9),
-            "total_activities": total_activities,
-            "days_used": len(days_data),
-            "processing_time_seconds": round(duration, 2),
-            "optimization_mode": optimization_mode,
-            "hotels_provided": hotels_provided,
-            "hotels_count": len(accommodations_data) if accommodations_data else 0
-        })
+        # analytics.track_request(f"hybrid_itinerary_{optimization_mode}_success", {
+        #     "efficiency_score": optimization_result.get("optimization_metrics", {}).get("efficiency_score", 0.9),
+        #     "total_activities": total_activities,
+        #     "days_used": len(days_data),
+        #     "processing_time_seconds": round(duration, 2),
+        #     "optimization_mode": optimization_mode,
+        #     "hotels_provided": hotels_provided,
+        #     "hotels_count": len(accommodations_data) if accommodations_data else 0
+        # })
         
         if hotels_provided:
             logging.info(f"✅ Optimización híbrida CON HOTELES completada en {duration:.2f}s")
@@ -2325,10 +2339,10 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
         
     except Exception as e:
         # Log error
-        analytics.track_error("hybrid_itinerary_error", str(e), {
-            "places_count": len(request.places),
-            "error_type": type(e).__name__
-        })
+        # analytics.track_error("hybrid_itinerary_error", str(e), {
+        #     "places_count": len(request.places),
+        #     "error_type": type(e).__name__
+        # })
         
         logging.error(f"❌ Error generating hybrid itinerary: {e}")
         import traceback
