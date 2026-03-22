@@ -2213,13 +2213,9 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
         
         return ItineraryResponse(**formatted_result)
         
+    except HTTPException:
+        raise
     except Exception as e:
-        # Log error
-        # analytics.track_error("hybrid_itinerary_error", str(e), {
-        #     "places_count": len(request.places),
-        #     "error_type": type(e).__name__
-        # })
-        
         logging.error(f"❌ Error generating hybrid itinerary: {e}")
         import traceback
         traceback.print_exc()
@@ -2501,7 +2497,7 @@ async def recommend_hotels_endpoint(request: HotelRecommendationRequest):
         hotel_recommender = HotelRecommender()
         
         # Generar recomendaciones
-        recommendations = hotel_recommender.recommend_hotels(
+        recommendations = await hotel_recommender.recommend_hotels(
             places_data,
             max_recommendations=request.max_recommendations,
             price_preference=request.price_preference

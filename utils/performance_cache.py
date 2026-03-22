@@ -8,7 +8,7 @@ import hashlib
 import json
 import logging
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Optional
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ class BoundedTTLCache:
         self._store: OrderedDict[str, tuple[Any, datetime]] = OrderedDict()
         self._max_size = max_size
 
-    def get(self, key: str) -> Any | None:
+    def get(self, key: str) -> Optional[Any]:
         entry = self._store.get(key)
         if entry is None:
             return None
