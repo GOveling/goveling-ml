@@ -1,4 +1,5 @@
 # api.py
+import os
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,20 +10,35 @@ import asyncio
 from datetime import datetime, time as dt_time, timedelta
 import time as time_module
 
-from models.schemas import Place, PlaceType, TransportMode, Coordinates, ItineraryRequest, ItineraryResponse, HotelRecommendationRequest, Activity, MultiCityOptimizationRequest, MultiCityItineraryResponse, MultiCityAnalysisRequest, MultiCityAnalysisResponse
+from models.schemas import (
+    Place, PlaceType, TransportMode, Coordinates,
+    ItineraryRequest, ItineraryResponse, HotelRecommendationRequest,
+    Activity, MultiCityOptimizationRequest, MultiCityItineraryResponse,
+    MultiCityAnalysisRequest, MultiCityAnalysisResponse,
+)
 from settings import settings
 from services.hotel_recommender import HotelRecommender
 from services.google_places_service import GooglePlacesService
 from services.multi_city_optimizer_simple import MultiCityOptimizerSimple
 from services.city_clustering_service import CityClusteringService
 from utils.logging_config import setup_production_logging
-from utils.performance_cache import cache_result, hash_places
+from utils.performance_cache import cache_result, hash_places, cleanup_expired_cache
 from utils.hybrid_optimizer_v31 import HybridOptimizerV31
 from utils.global_city2graph import global_city2graph, get_semantic_status, enhance_places_with_semantic_context
 from utils.global_real_city2graph import global_real_city2graph, get_real_semantic_status, enhance_places_with_real_semantic_context, get_global_real_semantic_clustering
 from services.hybrid_city2graph_service import get_hybrid_service
 from utils.geo_utils import haversine_km
 from services.ortools_monitoring import ortools_monitor, get_monitoring_dashboard, get_benchmark_report
+
+# Routers
+from routers.routing import router as routing_router, get_chile_router
+from models.route_schemas import RoutePointRequest
+from routers.monitoring import router as monitoring_router
+from routers.semantic import router as semantic_router
+
+# Middleware
+from middleware.auth import APIKeyMiddleware
+from middleware.rate_limit import RateLimitMiddleware
 
 # Configurar logging optimizado
 logger = setup_production_logging()
@@ -437,19 +453,41 @@ def _generate_decision_reasoning(factors: Dict, total_score: float, use_city2gra
 app = FastAPI(
     title="Goveling ML API",
     description="API de optimización de itinerarios con ML v2.2 - Con soporte para hoteles",
-    version="2.2.0"
+    version="2.2.0",
 )
 
-# Configurar CORS para permitir todas las solicitudes
+# ---- CORS ----
+# NOTE: allow_origins=["*"] with allow_credentials=True is invalid per the
+# CORS spec and browsers will reject the response.  When credentials are
+# needed, list explicit origins via the CORS_ORIGINS env var
+# (comma-separated).  Otherwise we default to permissive "*" WITHOUT
+# credentials, which is valid and works for public APIs.
+_cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
+if _cors_origins_raw == "*":
+    _cors_origins = ["*"]
+    _cors_credentials = False
+else:
+    _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+    _cors_credentials = True
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permite todos los orígenes
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],  # Permite todos los métodos
-    allow_headers=["*"],  # Permite todos los headers
-    expose_headers=["*"],  # Expone todos los headers
-    max_age=600,  # Cache preflight requests por 10 minutos
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_credentials,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=600,
 )
+
+# ---- Security & rate-limit middleware ----
+app.add_middleware(APIKeyMiddleware)
+app.add_middleware(RateLimitMiddleware)
+
+# ---- Include routers ----
+app.include_router(routing_router)
+app.include_router(monitoring_router)
+app.include_router(semantic_router)
 
 @app.get("/health")
 async def health_check():
@@ -575,9 +613,44 @@ async def get_circuit_breaker_status():
 async def startup_event():
     """Inicializar servicios básicos al startup de la API"""
     global hybrid_routing_service
-    logger.info("🚀 API iniciada - Servicio híbrido se cargará on-demand")
-    # No cargar el servicio híbrido al startup para mantener inicio rápido
+
+    # Validate critical settings at startup — fail fast
+    warnings = []
+    if not settings.GOOGLE_MAPS_API_KEY and not os.getenv("GOOGLE_MAPS_API_KEY"):
+        warnings.append("GOOGLE_MAPS_API_KEY not set — routing features will use fallbacks")
+    if settings.API_KEY:
+        logger.info("API key authentication enabled")
+    else:
+        warnings.append("API_KEY not set — all endpoints are unauthenticated")
+
+    for w in warnings:
+        logger.warning(f"STARTUP WARNING: {w}")
+
+    logger.info("API iniciada - Servicio hibrido se cargara on-demand")
     hybrid_routing_service = None
+
+    # Schedule periodic cache cleanup every 10 minutes
+    async def _cache_cleanup_loop():
+        while True:
+            await asyncio.sleep(600)
+            try:
+                removed = await cleanup_expired_cache()
+                if removed:
+                    logger.info(f"Cache cleanup: removed {removed} expired entries")
+            except Exception as e:
+                logger.error(f"Cache cleanup error: {e}")
+
+    asyncio.create_task(_cache_cleanup_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup resources on shutdown."""
+    global hybrid_routing_service
+    logger.info("Shutting down — cleaning up resources")
+    hybrid_routing_service = None
+    from utils.performance_cache import clear_cache
+    clear_cache()
 
 def get_or_initialize_hybrid_service():
     """Obtiene o inicializa el servicio híbrido (lazy loading)"""
@@ -614,18 +687,18 @@ async def routing_status():
     }
 
 @app.post("/route")
-async def calculate_route(request: dict):
-    """Calcular ruta entre dos puntos usando el servicio híbrido"""
+async def calculate_route(request: RoutePointRequest):
+    """Calcular ruta entre dos puntos usando el servicio hibrido"""
     service = get_or_initialize_hybrid_service()
-    
+
     if service is None:
         raise HTTPException(status_code=503, detail="Servicio de routing no disponible")
-    
+
     try:
-        origin_lat = request["origin"]["lat"]
-        origin_lon = request["origin"]["lon"]
-        dest_lat = request["destination"]["lat"]
-        dest_lon = request["destination"]["lon"]
+        origin_lat = request.origin["lat"]
+        origin_lon = request.origin["lon"]
+        dest_lat = request.destination["lat"]
+        dest_lon = request.destination["lon"]
         
         result = service.route(origin_lat, origin_lon, dest_lat, dest_lon)
         
@@ -653,204 +726,7 @@ async def calculate_route(request: dict):
         logger.error(f"Error calculando ruta: {e}")
         raise HTTPException(status_code=500, detail="Error interno calculando ruta")
 
-@app.get("/semantic/status")
-async def semantic_status():
-    """🧠 Estado del sistema semántico City2Graph (Demo y REAL)"""
-    semantic_info = get_semantic_status()
-    real_semantic_info = get_real_semantic_status()
-    
-    return {
-        "semantic_enabled": semantic_info['enabled'],
-        "service_status": semantic_info['service_status'],
-        "features": semantic_info['features'],
-        "real_osm_enabled": real_semantic_info['enabled'],
-        "real_service_status": real_semantic_info['service_status'],
-        "real_features": real_semantic_info['features'],
-        "capabilities": {
-            "semantic_clustering": "Agrupación inteligente por contexto urbano",
-            "walkability_scoring": "Puntuación precisa de caminabilidad",
-            "poi_discovery": "Descubrimiento contextual de lugares",
-            "cultural_context": "Adaptación a normas culturales locales",
-            "district_analysis": "Análisis semántico de distritos urbanos",
-            "real_osm_data": "Descarga y análisis de datos OSM reales (sin timeout)" if real_semantic_info['enabled'] else "No disponible"
-        },
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.post("/semantic/analyze")
-async def semantic_analyze_places(places: List[Place]):
-    """🧠 Análisis semántico detallado de lugares (Demo)"""
-    try:
-        # Convertir places a formato dict
-        places_data = []
-        for place in places:
-            place_dict = {
-                'name': place.name,
-                'lat': place.lat,
-                'lon': place.lon,
-                'type': place.type.value if hasattr(place.type, 'value') else str(place.type),
-                'rating': getattr(place, 'rating', 4.5),
-                'priority': getattr(place, 'priority', 5)
-            }
-            places_data.append(place_dict)
-        
-        # Enriquecer con contexto semántico
-        enhanced_places = await enhance_places_with_semantic_context(places_data)
-        
-        # Obtener clustering semántico
-        from utils.global_city2graph import get_global_semantic_clustering
-        clustering_result = await get_global_semantic_clustering(places_data)
-        
-        return {
-            "places_analyzed": len(places_data),
-            "enhanced_places": enhanced_places,
-            "semantic_clustering": clustering_result,
-            "analysis_summary": {
-                "semantic_strategy": clustering_result.get('strategy', 'unknown'),
-                "districts_found": len(clustering_result.get('recommendations', [])),
-                "optimization_insights": clustering_result.get('optimization_insights', []),
-                "total_semantic_districts": len([p for p in enhanced_places if p.get('semantic_district', 'Unknown') != 'Unknown'])
-            },
-            "data_source": "demo_simulated",
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error en análisis semántico: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error en análisis semántico: {str(e)}"
-        )
-
-@app.post("/semantic/analyze-real")
-async def semantic_analyze_places_real(places: List[Place]):
-    """🌍 Análisis semántico con datos OSM REALES (sin timeout)"""
-    try:
-        # Convertir places a formato dict
-        places_data = []
-        for place in places:
-            place_dict = {
-                'name': place.name,
-                'lat': place.lat,
-                'lon': place.lon,
-                'type': place.type.value if hasattr(place.type, 'value') else str(place.type),
-                'rating': getattr(place, 'rating', 4.5),
-                'priority': getattr(place, 'priority', 5)
-            }
-            places_data.append(place_dict)
-        
-        # Enriquecer con contexto semántico REAL
-        enhanced_places = await enhance_places_with_real_semantic_context(places_data)
-        
-        # Obtener clustering semántico REAL
-        clustering_result = await get_global_real_semantic_clustering(places_data)
-        
-        return {
-            "places_analyzed": len(places_data),
-            "enhanced_places": enhanced_places,
-            "semantic_clustering": clustering_result,
-            "analysis_summary": {
-                "semantic_strategy": clustering_result.get('strategy', 'unknown'),
-                "districts_found": len(clustering_result.get('recommendations', [])),
-                "optimization_insights": clustering_result.get('optimization_insights', []),
-                "total_semantic_districts": len([p for p in enhanced_places if p.get('semantic_district', 'Unknown') != 'Unknown']),
-                "total_real_pois": clustering_result.get('total_real_pois_analyzed', 0),
-                "street_network_size": clustering_result.get('street_network_size', 0),
-                "transport_network_size": clustering_result.get('transport_network_size', 0)
-            },
-            "data_source": "openstreetmap_complete",
-            "processing_note": "Este análisis puede tomar varios minutos - descarga datos OSM reales",
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error en análisis semántico REAL: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error en análisis semántico REAL: {str(e)}"
-        )
-
-@app.get("/semantic/city/{city_name}")
-async def semantic_city_summary(city_name: str):
-    """🏙️ Resumen semántico completo de una ciudad (Demo)"""
-    try:
-        # Obtener resumen de la ciudad desde el manager global
-        summary = await global_city2graph.get_city_summary(city_name)
-        
-        return {
-            "city": city_name,
-            "city_summary": summary,
-            "semantic_available": global_city2graph.is_semantic_enabled(),
-            "data_source": "demo_simulated",
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error obteniendo resumen de {city_name}: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error obteniendo resumen semántico de {city_name}: {str(e)}"
-        )
-
-@app.get("/semantic/city-real/{city_name}")
-async def semantic_city_summary_real(city_name: str):
-    """🌍 Resumen semántico con datos OSM REALES de una ciudad"""
-    try:
-        # Obtener resumen de la ciudad REAL desde el manager global
-        summary = await global_real_city2graph.get_real_city_summary(city_name)
-        
-        return {
-            "city": city_name,
-            "city_summary": summary,
-            "real_semantic_available": global_real_city2graph.is_real_semantic_enabled(),
-            "data_source": "openstreetmap_complete",
-            "processing_note": "Este análisis descarga datos OSM reales - puede tomar tiempo",
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error obteniendo resumen REAL de {city_name}: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error obteniendo resumen semántico REAL de {city_name}: {str(e)}"
-        )
-
-# Variable global para controlar qué tipo de análisis usar
-SEMANTIC_MODE = "auto"  # "demo", "real", "auto"
-
-@app.post("/semantic/config")
-async def set_semantic_mode(mode: str):
-    """⚙️ Configurar modo de análisis semántico: demo, real, o auto"""
-    global SEMANTIC_MODE
-    
-    valid_modes = ["demo", "real", "auto"]
-    if mode not in valid_modes:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Modo inválido. Opciones válidas: {valid_modes}"
-        )
-    
-    SEMANTIC_MODE = mode
-    
-    return {
-        "mode_set": mode,
-        "description": {
-            "demo": "Usa datos simulados - rápido y confiable",
-            "real": "Descarga datos OSM reales - completo pero lento",
-            "auto": "Usa real si está disponible, sino demo"
-        }.get(mode, ""),
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.get("/semantic/config")
-async def get_semantic_mode():
-    """⚙️ Obtener configuración actual del modo semántico"""
-    return {
-        "current_mode": SEMANTIC_MODE,
-        "demo_available": get_semantic_status()['enabled'],
-        "real_available": get_real_semantic_status()['enabled'],
-        "timestamp": datetime.now().isoformat()
-    }
+# Semantic endpoints moved to routers/semantic.py
 
 @app.get("/cache/stats", tags=["Cache Management"])
 async def get_cache_stats():
@@ -940,12 +816,12 @@ async def debug_suggestions(lat: float = -23.6521, lon: float = -70.3958, day: i
         }
         
     except Exception as e:
-        import traceback
-        return {
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-            "error_type": str(e.__class__.__name__)
-        }
+        logger.error(f"Error in debug/suggestions: {e}", exc_info=True)
+        error_response = {"error": str(e), "error_type": type(e).__name__}
+        if settings.DEBUG:
+            import traceback
+            error_response["traceback"] = traceback.format_exc()
+        return error_response
 
 @app.post("/create_itinerary", response_model=ItineraryResponse, tags=["Core"])
 @app.post("/api/v2/itinerary/generate-hybrid", response_model=ItineraryResponse, tags=["Hybrid Optimizer"])
@@ -2682,357 +2558,11 @@ async def recommend_hotels_endpoint(request: HotelRecommendationRequest):
         )
 
 
-# ========================================================================
-# 📊 OR-TOOLS MONITORING & ANALYTICS ENDPOINTS - WEEK 4
-# ========================================================================
-
-@app.get("/api/v4/monitoring/dashboard", tags=["OR-Tools Monitoring"])
-async def get_ortools_monitoring_dashboard():
-    """
-    Get comprehensive OR-Tools monitoring dashboard
-    Week 4: Real-time performance metrics, success rates, alerts
-    """
-    try:
-        start_time = time_module.time()
-        dashboard_data = await get_monitoring_dashboard()
-        
-        duration = time_module.time() - start_time
-        dashboard_data["query_time_ms"] = round(duration * 1000, 2)
-        
-        logging.info(f"📊 Monitoring dashboard generated in {duration:.3f}s")
-        return dashboard_data
-        
-    except Exception as e:
-        logging.error(f"❌ Error getting monitoring dashboard: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving monitoring dashboard: {str(e)}"
-        )
-
-@app.get("/api/v4/monitoring/benchmark", tags=["OR-Tools Monitoring"])
-async def get_ortools_benchmark_comparison():
-    """
-    Get OR-Tools vs Legacy benchmark comparison
-    Week 4: Performance comparison, recommendations, status analysis
-    """
-    try:
-        start_time = time_module.time()
-        benchmark_data = await get_benchmark_report()
-        
-        duration = time_module.time() - start_time
-        benchmark_data["query_time_ms"] = round(duration * 1000, 2)
-        
-        logging.info(f"🔬 Benchmark comparison generated in {duration:.3f}s")
-        return benchmark_data
-        
-    except Exception as e:
-        logging.error(f"❌ Error getting benchmark comparison: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving benchmark comparison: {str(e)}"
-        )
-
-@app.get("/api/v4/monitoring/alerts", tags=["OR-Tools Monitoring"])
-async def get_active_alerts():
-    """
-    Get active OR-Tools production alerts
-    Week 4: Real-time alert status, severity levels, alert history
-    """
-    try:
-        start_time = time_module.time()
-        
-        # Get active alerts and recent alert history
-        active_alerts = list(ortools_monitor.active_alerts.values())
-        
-        # Get recent alert history (last 24 hours)
-        cutoff_time = datetime.now() - timedelta(hours=24)
-        recent_alerts = [
-            alert for alert in ortools_monitor.alert_history
-            if alert['timestamp'] >= cutoff_time
-        ]
-        
-        alert_summary = {
-            "timestamp": datetime.now().isoformat(),
-            "active_alerts": active_alerts,
-            "active_count": len(active_alerts),
-            "alert_history_24h": recent_alerts,
-            "alerts_24h_count": len(recent_alerts),
-            "severity_breakdown": {
-                "HIGH": len([a for a in active_alerts if a.get('severity') == 'HIGH']),
-                "MEDIUM": len([a for a in active_alerts if a.get('severity') == 'MEDIUM']),
-                "LOW": len([a for a in active_alerts if a.get('severity') == 'LOW'])
-            },
-            "health_status": "CRITICAL" if any(a.get('severity') == 'HIGH' for a in active_alerts) 
-                           else "WARNING" if active_alerts 
-                           else "HEALTHY"
-        }
-        
-        duration = time_module.time() - start_time
-        alert_summary["query_time_ms"] = round(duration * 1000, 2)
-        
-        # Log alert status
-        status = alert_summary["health_status"]
-        if status == "CRITICAL":
-            logging.error(f"🚨 CRITICAL: {len(active_alerts)} active alerts")
-        elif status == "WARNING":
-            logging.warning(f"⚠️ WARNING: {len(active_alerts)} active alerts")
-        else:
-            logging.info(f"✅ HEALTHY: No active alerts")
-        
-        return alert_summary
-        
-    except Exception as e:
-        logging.error(f"❌ Error getting alerts: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving alerts: {str(e)}"
-        )
-
-@app.get("/api/v4/monitoring/health", tags=["OR-Tools Monitoring"])
-async def get_ortools_health_status():
-    """
-    Get OR-Tools production health status
-    Week 4: Quick health check, performance indicators, system status
-    """
-    try:
-        start_time = time_module.time()
-        
-        # Get recent performance summary (last hour)
-        summary = await ortools_monitor.get_performance_summary(hours=1)
-        
-        # Determine health status
-        if not summary or summary.get("overview", {}).get("total_requests", 0) == 0:
-            health_status = "NO_DATA"
-            health_score = 0
-        else:
-            overview = summary["overview"]
-            performance = summary["performance"]
-            
-            # Calculate health score (0-100)
-            success_rate = overview["success_rate"]
-            avg_time = performance["avg_execution_time_ms"]
-            
-            # Health scoring
-            success_score = success_rate * 50  # 50 points for success rate
-            time_score = max(0, 50 - (avg_time / 100))  # 50 points for speed (penalty for slow)
-            health_score = min(100, success_score + time_score)
-            
-            # Determine status
-            if health_score >= 90:
-                health_status = "EXCELLENT"
-            elif health_score >= 75:
-                health_status = "GOOD"
-            elif health_score >= 50:
-                health_status = "DEGRADED"
-            else:
-                health_status = "CRITICAL"
-        
-        # Check for active alerts
-        active_alerts_count = len(ortools_monitor.active_alerts)
-        if active_alerts_count > 0:
-            health_status = "ALERTS_ACTIVE"
-        
-        health_data = {
-            "timestamp": datetime.now().isoformat(),
-            "health_status": health_status,
-            "health_score": round(health_score, 1),
-            "active_alerts": active_alerts_count,
-            "recent_metrics": summary.get("overview", {}),
-            "performance_indicators": {
-                "avg_response_time_ms": summary.get("performance", {}).get("avg_execution_time_ms", 0),
-                "success_rate": summary.get("overview", {}).get("success_rate", 0),
-                "requests_last_hour": summary.get("overview", {}).get("total_requests", 0)
-            },
-            "recommendations": []
-        }
-        
-        # Add recommendations based on health
-        if health_status == "CRITICAL":
-            health_data["recommendations"].append("Immediate investigation required - OR-Tools severely degraded")
-        elif health_status == "DEGRADED":
-            health_data["recommendations"].append("Check distance cache and parallel optimizer performance")
-        elif health_status == "ALERTS_ACTIVE":
-            health_data["recommendations"].append("Review active alerts and take corrective action")
-        elif health_status == "NO_DATA":
-            health_data["recommendations"].append("No recent OR-Tools activity - monitor for traffic")
-        
-        duration = time_module.time() - start_time
-        health_data["query_time_ms"] = round(duration * 1000, 2)
-        
-        # Log health status
-        logging.info(f"🩺 OR-Tools Health: {health_status} (Score: {health_score:.1f}/100)")
-        
-        return health_data
-        
-    except Exception as e:
-        logging.error(f"❌ Error getting health status: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving health status: {str(e)}"
-        )
-
-@app.get("/api/v4/monitoring/metrics/summary", tags=["OR-Tools Monitoring"])
-async def get_metrics_summary(hours: int = 24):
-    """
-    Get detailed OR-Tools metrics summary
-    Week 4: Customizable time window, detailed statistics, method comparison
-    """
-    try:
-        start_time = time_module.time()
-        
-        # Validate hours parameter
-        if hours < 1 or hours > 168:  # Max 1 week
-            raise HTTPException(
-                status_code=400,
-                detail="Hours parameter must be between 1 and 168 (1 week)"
-            )
-        
-        summary = await ortools_monitor.get_performance_summary(hours=hours)
-        
-        duration = time_module.time() - start_time
-        summary["query_time_ms"] = round(duration * 1000, 2)
-        
-        logging.info(f"📈 Metrics summary ({hours}h) generated in {duration:.3f}s")
-        return summary
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"❌ Error getting metrics summary: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving metrics summary: {str(e)}"
-        )
+# Monitoring endpoints moved to routers/monitoring.py
 
 
-# ========================================================================
-# 🚶‍♂️🚗🚴‍♂️ MULTI-MODAL ROUTING ENDPOINTS
-# ========================================================================
-
-# Inicializar el router multi-modal (lazy loading)
-chile_multimodal_router = None
-
-def get_chile_router():
-    """Obtener o inicializar el router multi-modal (lazy loading con S3 download)"""
-    global chile_multimodal_router
-    
-    if chile_multimodal_router is None:
-        try:
-            from services.chile_multimodal_router import ChileMultiModalRouter
-            
-            # Intentar descargar grafos críticos desde S3 automáticamente
-            try:
-                from utils.s3_graphs_manager import S3GraphsManager
-                s3_manager = S3GraphsManager()
-                
-                if s3_manager.s3_client:  # Solo si S3 está configurado
-                    logger.info("☁️ Verificando grafos críticos en Amazon S3...")
-                    s3_manager.ensure_critical_graphs()
-                else:
-                    logger.info("⚠️ S3 no configurado, usando grafos locales disponibles")
-                    
-            except Exception as s3_error:
-                logger.warning(f"⚠️ S3 download falló: {s3_error} - usando grafos locales")
-            
-            # Inicializar router (con o sin cache S3)
-            chile_multimodal_router = ChileMultiModalRouter()
-            logger.info("✅ ChileMultiModalRouter inicializado correctamente")
-            
-        except Exception as e:
-            logger.error(f"❌ Error inicializando ChileMultiModalRouter: {e}")
-            chile_multimodal_router = "failed"
-    
-    return chile_multimodal_router if chile_multimodal_router != "failed" else None
-
-@app.get("/health/multimodal", tags=["Multi-Modal Routing"])
-async def multimodal_health_check():
-    """
-    🩺 Health check del sistema multi-modal con estadísticas de lazy loading
-    Verifica estado de caches, memoria y performance del sistema
-    """
-    try:
-        start_time = time_module.time()
-        
-        router = get_chile_router()
-        
-        if router is None:
-            return {
-                "status": "unavailable",
-                "message": "Router multi-modal no disponible",
-                "timestamp": datetime.now().isoformat()
-            }
-        
-        # Verificar estado de caches (incluye estadísticas de memoria)
-        cache_status = router.get_cache_status()
-        memory_usage = router.get_memory_usage()
-        performance_stats = router.get_performance_stats()
-        
-        # Calcular métricas de salud avanzadas
-        total_cache_size_mb = sum(
-            cache['size'] for cache in cache_status.values() 
-            if cache['exists']
-        )
-        
-        modes_available = [
-            mode for mode, cache in cache_status.items() 
-            if cache['exists']
-        ]
-        
-        modes_in_memory = sum(cache.get('loaded_in_memory', False) for cache in cache_status.values())
-        
-        # Score de salud considerando disponibilidad y eficiencia
-        availability_score = (len(modes_available) / 3) * 50  # 50 puntos por disponibilidad
-        efficiency_score = 0
-        
-        # Score de eficiencia basado en hit ratio
-        total_requests = performance_stats['performance_summary']['total_requests']
-        if total_requests > 0:
-            hit_ratio = performance_stats['performance_summary']['overall_hit_ratio']
-            efficiency_score = hit_ratio * 50  # 50 puntos por eficiencia
-        else:
-            efficiency_score = 50  # Sin datos = score neutro
-        
-        health_score = availability_score + efficiency_score
-        
-        # Determinar estado de salud
-        if health_score >= 90:
-            health_status = "excellent"
-        elif health_score >= 75:
-            health_status = "good"
-        elif health_score >= 50:
-            health_status = "degraded"
-        else:
-            health_status = "critical"
-        
-        processing_time = time_module.time() - start_time
-        
-        return {
-            "status": health_status,
-            "health_score": round(health_score, 1),
-            "modes_available": modes_available,
-            "modes_in_memory": modes_in_memory,
-            "total_modes": 3,
-            "cache_status": cache_status,
-            "memory_usage": memory_usage,
-            "performance_stats": performance_stats['performance_summary'],
-            "total_cache_size_mb": round(total_cache_size_mb, 2),
-            "lazy_loading": {
-                "enabled": True,
-                "memory_efficiency": f"{memory_usage['total_estimated_mb']:.1f}MB in memory",
-                "cache_hit_ratio": performance_stats['performance_summary']['overall_hit_ratio']
-            },
-            "performance": {
-                "health_check_time_ms": round(processing_time * 1000, 2)
-            },
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error en health check multi-modal: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error en health check multi-modal: {str(e)}"
-        )
+# Routing endpoints (drive/walk/bike/compare, cache, health/multimodal)
+# moved to routers/routing.py
 
 # Función auxiliar para calcular duración de visita
 def calculate_visit_duration(place_type: str) -> int:
@@ -3580,484 +3110,6 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
     except Exception as e:
         logger.error(f"💥 Error en itinerario multi-modal: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generando itinerario multi-modal: {str(e)}")
-
-@app.post("/route/drive", tags=["Multi-Modal Routing"])
-async def route_drive(request: dict):
-    """
-    🚗 Calcular ruta en vehículo
-    Utiliza cache de drive_service (1792MB) para routing vehicular
-    """
-    try:
-        start_time = time_module.time()
-        
-        # Validar entrada
-        required_fields = ['start_lat', 'start_lon', 'end_lat', 'end_lon']
-        for field in required_fields:
-            if field not in request:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Campo requerido faltante: {field}"
-                )
-        
-        router = get_chile_router()
-        if router is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Servicio de routing multi-modal no disponible"
-            )
-        
-        # Calcular ruta
-        route = router.get_route(
-            start_lat=float(request['start_lat']),
-            start_lon=float(request['start_lon']),
-            end_lat=float(request['end_lat']),
-            end_lon=float(request['end_lon']),
-            mode='drive'
-        )
-        
-        if not route or not route.get('success'):
-            raise HTTPException(
-                status_code=404,
-                detail="No se pudo calcular la ruta en vehículo"
-            )
-        
-        processing_time = time_module.time() - start_time
-        
-        # Agregar métricas de performance
-        route['performance'] = {
-            'processing_time_ms': round(processing_time * 1000, 2),
-            'cache_source': 'chile_graph_cache.pkl'
-        }
-        
-        logger.info(f"✅ Ruta drive: {route['distance_km']}km, {route['time_minutes']}min")
-        
-        return route
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error calculando ruta drive: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error calculando ruta en vehículo: {str(e)}"
-        )
-
-@app.post("/route/walk", tags=["Multi-Modal Routing"])
-async def route_walk(request: dict):
-    """
-    🚶‍♂️ Calcular ruta peatonal
-    Utiliza cache de walking (365MB) para routing peatonal
-    """
-    try:
-        start_time = time_module.time()
-        
-        # Validar entrada
-        required_fields = ['start_lat', 'start_lon', 'end_lat', 'end_lon']
-        for field in required_fields:
-            if field not in request:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Campo requerido faltante: {field}"
-                )
-        
-        router = get_chile_router()
-        if router is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Servicio de routing multi-modal no disponible"
-            )
-        
-        # Calcular ruta
-        route = router.get_route(
-            start_lat=float(request['start_lat']),
-            start_lon=float(request['start_lon']),
-            end_lat=float(request['end_lat']),
-            end_lon=float(request['end_lon']),
-            mode='walk'
-        )
-        
-        if not route or not route.get('success'):
-            raise HTTPException(
-                status_code=404,
-                detail="No se pudo calcular la ruta peatonal"
-            )
-        
-        processing_time = time_module.time() - start_time
-        
-        # Agregar métricas de performance
-        route['performance'] = {
-            'processing_time_ms': round(processing_time * 1000, 2),
-            'cache_source': 'santiago_metro_walking_cache.pkl'
-        }
-        
-        logger.info(f"✅ Ruta walk: {route['distance_km']}km, {route['time_minutes']}min")
-        
-        return route
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error calculando ruta walk: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error calculando ruta peatonal: {str(e)}"
-        )
-
-@app.post("/route/bike", tags=["Multi-Modal Routing"])
-async def route_bike(request: dict):
-    """
-    🚴‍♂️ Calcular ruta en bicicleta
-    Utiliza cache de cycling (323MB) para routing en bicicleta
-    """
-    try:
-        start_time = time_module.time()
-        
-        # Validar entrada
-        required_fields = ['start_lat', 'start_lon', 'end_lat', 'end_lon']
-        for field in required_fields:
-            if field not in request:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Campo requerido faltante: {field}"
-                )
-        
-        router = get_chile_router()
-        if router is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Servicio de routing multi-modal no disponible"
-            )
-        
-        # Calcular ruta
-        route = router.get_route(
-            start_lat=float(request['start_lat']),
-            start_lon=float(request['start_lon']),
-            end_lat=float(request['end_lat']),
-            end_lon=float(request['end_lon']),
-            mode='bike'
-        )
-        
-        if not route or not route.get('success'):
-            raise HTTPException(
-                status_code=404,
-                detail="No se pudo calcular la ruta en bicicleta"
-            )
-        
-        processing_time = time_module.time() - start_time
-        
-        # Agregar métricas de performance
-        route['performance'] = {
-            'processing_time_ms': round(processing_time * 1000, 2),
-            'cache_source': 'santiago_metro_cycling_cache.pkl'
-        }
-        
-        logger.info(f"✅ Ruta bike: {route['distance_km']}km, {route['time_minutes']}min")
-        
-        return route
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error calculando ruta bike: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error calculando ruta en bicicleta: {str(e)}"
-        )
-
-@app.post("/route/compare", tags=["Multi-Modal Routing"])
-async def route_compare(request: dict):
-    """
-    ⚖️ Comparar rutas entre todos los modos de transporte
-    Calcula simultáneamente rutas para drive, walk y bike
-    """
-    try:
-        start_time = time_module.time()
-        
-        # Validar entrada
-        required_fields = ['start_lat', 'start_lon', 'end_lat', 'end_lon']
-        for field in required_fields:
-            if field not in request:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Campo requerido faltante: {field}"
-                )
-        
-        router = get_chile_router()
-        if router is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Servicio de routing multi-modal no disponible"
-            )
-        
-        # Calcular rutas para todos los modos
-        routes = router.calculate_multimodal_routes(
-            start_lat=float(request['start_lat']),
-            start_lon=float(request['start_lon']),
-            end_lat=float(request['end_lat']),
-            end_lon=float(request['end_lon'])
-        )
-        
-        processing_time = time_module.time() - start_time
-        
-        # Procesar resultados
-        successful_routes = {
-            mode: route for mode, route in routes.items() 
-            if route and route.get('success')
-        }
-        
-        if not successful_routes:
-            raise HTTPException(
-                status_code=404,
-                detail="No se pudo calcular ninguna ruta"
-            )
-        
-        # Análisis comparativo
-        fastest_mode = min(
-            successful_routes.keys(),
-            key=lambda mode: successful_routes[mode]['time_minutes']
-        )
-        
-        shortest_mode = min(
-            successful_routes.keys(),
-            key=lambda mode: successful_routes[mode]['distance_km']
-        )
-        
-        # Recomendación inteligente
-        if 'walk' in successful_routes and successful_routes['walk']['time_minutes'] <= 15:
-            recommended_mode = 'walk'
-            recommendation_reason = 'Distancia corta - caminar es eficiente y saludable'
-        elif 'bike' in successful_routes and successful_routes['bike']['time_minutes'] <= 30:
-            recommended_mode = 'bike'
-            recommendation_reason = 'Distancia media - bicicleta es rápida y ecológica'
-        else:
-            recommended_mode = 'drive'
-            recommendation_reason = 'Distancia larga - vehículo es la opción más práctica'
-        
-        comparison_result = {
-            'routes': successful_routes,
-            'analysis': {
-                'fastest_mode': fastest_mode,
-                'fastest_time_minutes': successful_routes[fastest_mode]['time_minutes'],
-                'shortest_mode': shortest_mode,
-                'shortest_distance_km': successful_routes[shortest_mode]['distance_km'],
-                'recommended_mode': recommended_mode,
-                'recommendation_reason': recommendation_reason,
-                'modes_available': list(successful_routes.keys()),
-                'modes_failed': [
-                    mode for mode, route in routes.items()
-                    if not route or not route.get('success')
-                ]
-            },
-            'performance': {
-                'processing_time_ms': round(processing_time * 1000, 2),
-                'routes_calculated': len(successful_routes),
-                'total_modes_attempted': len(routes)
-            },
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        logger.info(
-            f"✅ Comparación multi-modal: {len(successful_routes)} rutas, "
-            f"recomendado: {recommended_mode}"
-        )
-        
-        return comparison_result
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error en comparación multi-modal: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error comparando rutas multi-modales: {str(e)}"
-        )
-
-@app.post("/cache/preload", tags=["Multi-Modal Routing"])
-async def preload_cache(request: dict):
-    """
-    🚀 Pre-cargar cache específico para optimización
-    Body: {"mode": "drive|walk|bike"} o {"mode": "all"}
-    """
-    try:
-        router = get_chile_router()
-        if router is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Servicio de routing multi-modal no disponible"
-            )
-        
-        mode = request.get('mode')
-        if not mode:
-            raise HTTPException(
-                status_code=400,
-                detail="Campo 'mode' requerido (drive|walk|bike|all)"
-            )
-        
-        start_time = time_module.time()
-        
-        if mode == "all":
-            # Pre-cargar todos los caches
-            results = router.preload_all_caches()
-            processing_time = time_module.time() - start_time
-            
-            successful_loads = sum(results.values())
-            
-            return {
-                "success": True,
-                "mode": "all",
-                "results": results,
-                "successful_loads": successful_loads,
-                "total_modes": len(results),
-                "processing_time_ms": round(processing_time * 1000, 2),
-                "message": f"Pre-carga completada: {successful_loads}/{len(results)} caches cargados",
-                "timestamp": datetime.now().isoformat()
-            }
-        else:
-            # Pre-cargar cache específico
-            if mode not in ['drive', 'walk', 'bike']:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Modo debe ser: drive, walk, bike, o all"
-                )
-            
-            success = router.preload_cache(mode)
-            processing_time = time_module.time() - start_time
-            
-            return {
-                "success": success,
-                "mode": mode,
-                "processing_time_ms": round(processing_time * 1000, 2),
-                "message": f"Cache {mode} {'cargado exitosamente' if success else 'falló al cargar'}",
-                "timestamp": datetime.now().isoformat()
-            }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error pre-cargando cache: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error pre-cargando cache: {str(e)}"
-        )
-
-@app.post("/cache/clear", tags=["Multi-Modal Routing"])
-async def clear_cache(request: dict):
-    """
-    🧹 Limpiar cache de memoria para liberar RAM
-    Body: {"mode": "drive|walk|bike"} o {"mode": "all"}
-    """
-    try:
-        router = get_chile_router()
-        if router is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Servicio de routing multi-modal no disponible"
-            )
-        
-        mode = request.get('mode')
-        if not mode:
-            raise HTTPException(
-                status_code=400,
-                detail="Campo 'mode' requerido (drive|walk|bike|all)"
-            )
-        
-        # Obtener uso de memoria antes
-        memory_before = router.get_memory_usage()
-        
-        if mode == "all":
-            router.clear_memory_cache()
-            message = "Todos los caches eliminados de memoria"
-        else:
-            if mode not in ['drive', 'walk', 'bike']:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Modo debe ser: drive, walk, bike, o all"
-                )
-            
-            router.clear_memory_cache(mode)
-            message = f"Cache {mode} eliminado de memoria"
-        
-        # Obtener uso de memoria después
-        memory_after = router.get_memory_usage()
-        memory_freed = memory_before['total_estimated_mb'] - memory_after['total_estimated_mb']
-        
-        return {
-            "success": True,
-            "mode": mode,
-            "memory_freed_mb": round(memory_freed, 2),
-            "memory_before_mb": round(memory_before['total_estimated_mb'], 2),
-            "memory_after_mb": round(memory_after['total_estimated_mb'], 2),
-            "message": message,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error limpiando cache: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error limpiando cache: {str(e)}"
-        )
-
-@app.get("/cache/optimize", tags=["Multi-Modal Routing"])
-async def optimize_memory():
-    """
-    🔧 Optimizar uso de memoria basado en patrones de uso
-    Analiza estadísticas y libera memoria de caches poco utilizados
-    """
-    try:
-        router = get_chile_router()
-        if router is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Servicio de routing multi-modal no disponible"
-            )
-        
-        # Ejecutar optimización automática
-        optimization_report = router.optimize_memory()
-        
-        return {
-            "success": True,
-            "optimization_report": optimization_report,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error optimizando memoria: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error optimizando memoria: {str(e)}"
-        )
-
-@app.get("/performance/stats", tags=["Multi-Modal Routing"])
-async def get_performance_statistics():
-    """
-    📊 Obtener estadísticas detalladas de rendimiento del sistema multi-modal
-    Incluye uso de caches, hit ratios, memoria y patrones de uso
-    """
-    try:
-        router = get_chile_router()
-        if router is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Servicio de routing multi-modal no disponible"
-            )
-        
-        # Obtener estadísticas completas
-        stats = router.get_performance_stats()
-        
-        # Agregar timestamp
-        stats['generated_at'] = datetime.now().isoformat()
-        
-        return stats
-        
-    except Exception as e:
-        logger.error(f"❌ Error obteniendo estadísticas: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error obteniendo estadísticas: {str(e)}"
-        )
 
 # ===== FUNCIONES AUXILIARES PARA SUGERENCIAS INTELIGENTES =====
 

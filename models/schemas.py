@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Optional, Union, Literal, Dict
 from datetime import date, time, datetime
 from enum import Enum
@@ -65,14 +65,16 @@ class Place(BaseModel):
     address: Optional[str] = None
     google_place_id: Optional[str] = None
 
-    @validator('name')
+    @field_validator('name')
+    @classmethod
     def name_must_not_be_empty(cls, v):
         if not v.strip():
             raise ValueError('El nombre no puede estar vacío')
         return v.strip()
 
-    @validator('lon', 'long', pre=True)
-    def validate_longitude(cls, v, values):
+    @field_validator('lon', 'long', mode='before')
+    @classmethod
+    def validate_longitude(cls, v):
         if v is None:
             return None
         if isinstance(v, str):
@@ -82,8 +84,9 @@ class Place(BaseModel):
                 raise ValueError('La longitud debe ser un número válido')
         return v
 
-    @validator('lat', pre=True)
-    def validate_latitude(cls, v, values):
+    @field_validator('lat', mode='before')
+    @classmethod
+    def validate_latitude(cls, v):
         if isinstance(v, str):
             try:
                 return float(v)
@@ -91,8 +94,9 @@ class Place(BaseModel):
                 raise ValueError('La latitud debe ser un número válido')
         return v
 
-    @validator('type', 'category', pre=True)
-    def validate_type(cls, v, values):
+    @field_validator('type', 'category', mode='before')
+    @classmethod
+    def validate_type(cls, v):
         if v is None:
             return None
         if isinstance(v, str):
@@ -162,7 +166,8 @@ class DailySchedule(BaseModel):
     start_hour: int = Field(..., ge=0, le=23, description="Hora de inicio del día (0-23)")
     end_hour: int = Field(..., ge=0, le=23, description="Hora de fin del día (0-23)")
     
-    @validator('date')
+    @field_validator('date')
+    @classmethod
     def validate_date_format(cls, v):
         try:
             datetime.strptime(v, '%Y-%m-%d')
@@ -170,9 +175,10 @@ class DailySchedule(BaseModel):
         except ValueError:
             raise ValueError('La fecha debe estar en formato YYYY-MM-DD')
     
-    @validator('end_hour')
-    def validate_hours(cls, v, values):
-        if 'start_hour' in values and v <= values['start_hour']:
+    @field_validator('end_hour')
+    @classmethod
+    def validate_hours(cls, v, info):
+        if 'start_hour' in info.data and v <= info.data['start_hour']:
             raise ValueError('end_hour debe ser mayor que start_hour')
         return v
     
@@ -212,14 +218,16 @@ class ItineraryRequest(BaseModel):
     preferences: Optional[Dict] = Field(default_factory=dict)
     accommodations: Optional[List[Place]] = Field(default_factory=list)
 
-    @validator('transport_mode', pre=True)
+    @field_validator('transport_mode', mode='before')
+    @classmethod
     def validate_transport_mode(cls, v):
         if isinstance(v, str):
             v = v.strip('"').lower()
             return TransportMode(v)
         return v
 
-    @validator('start_date', 'end_date', pre=True)
+    @field_validator('start_date', 'end_date', mode='before')
+    @classmethod
     def validate_dates(cls, v):
         if isinstance(v, str):
             try:
@@ -228,10 +236,15 @@ class ItineraryRequest(BaseModel):
                 raise ValueError(f'Formato de fecha inválido. Debe ser YYYY-MM-DD: {str(e)}')
         return v
     
-    @validator('end_date')
-    def end_date_after_start(cls, v, values):
-        if 'start_date' in values and v < values['start_date']:
-            raise ValueError('Fecha fin debe ser posterior a fecha inicio')
+    @field_validator('end_date')
+    @classmethod
+    def end_date_after_start(cls, v, info):
+        if 'start_date' in info.data:
+            if v < info.data['start_date']:
+                raise ValueError('Fecha fin debe ser posterior a fecha inicio')
+            trip_days = (v - info.data['start_date']).days
+            if trip_days > 90:
+                raise ValueError('Duracion maxima del viaje es 90 dias')
         return v
 
     class Config:
