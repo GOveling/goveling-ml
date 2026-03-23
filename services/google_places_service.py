@@ -33,7 +33,7 @@ class GooglePlacesService:
         try:
             # Usar tipos por defecto si no se proporcionan
             if types is None:
-                types = ['tourist_attraction', 'restaurant', 'point_of_interest']
+                types = ['tourist_attraction', 'museum', 'point_of_interest']
             
             # Filtrar kwargs no reconocidos
             _ = kwargs.pop('preferences', None)  # Ignorar preferences si existe

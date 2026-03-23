@@ -1086,7 +1086,8 @@ class HybridOptimizerV31:
     
     def cluster_pois(self, places: List[Dict]) -> List[Cluster]:
         """🗺️ Clustering POIs usando DBSCAN con métrica Haversine"""
-        pois = [p for p in places if p.get('type', '').lower() != 'accommodation']
+        lodging_types = {'accommodation', 'hotel', 'lodging', 'motel', 'hostel', 'resort'}
+        pois = [p for p in places if p.get('type', '').lower() not in lodging_types]
         
         if not pois:
             self.logger.warning("No hay POIs para clustering")

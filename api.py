@@ -2694,11 +2694,20 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
         if start_date > end_date:
             raise HTTPException(status_code=400, detail="La fecha de inicio debe ser anterior a la fecha de fin")
         
-        # Normalizar lugares de entrada
+        # Normalizar lugares de entrada — separar alojamientos de actividades
+        LODGING_TYPES = {'hotel', 'lodging', 'accommodation', 'motel', 'hostel', 'resort'}
         normalized_places = []
         for place in request.places:
             place_dict = place.dict() if hasattr(place, 'dict') else place
-            place_dict['duration_minutes'] = place_dict.get('duration_minutes', 
+            place_type = (place_dict.get('type') or place_dict.get('category') or '').lower()
+
+            # Hotels go as accommodation, never as activity POIs
+            if place_type in LODGING_TYPES:
+                place_dict['type'] = 'accommodation'
+                place_dict['place_type'] = 'accommodation'
+                logger.info(f"🏨 Marcado como alojamiento (no actividad): {place_dict.get('name', 'N/A')}")
+
+            place_dict['duration_minutes'] = place_dict.get('duration_minutes',
                                                           calculate_visit_duration(place_dict.get('type', 'point_of_interest')))
             normalized_places.append(place_dict)
         
@@ -2825,8 +2834,13 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
                         return default
             
             for idx, activity in enumerate(activities):
+                # Skip accommodation/hotel entries — they are base, not activities
+                act_type = (get_activity_value(activity, 'type') or get_activity_value(activity, 'category') or '').lower()
+                if act_type in {'hotel', 'lodging', 'accommodation', 'motel', 'hostel', 'resort'}:
+                    continue
+
                 # Detectar si es un transfer
-                if (get_activity_value(activity, 'type') == 'intercity_transfer' or 
+                if (act_type == 'intercity_transfer' or
                     get_activity_value(activity, 'activity_type') == 'intercity_transfer'):
                     # Es un transfer
                     transfer_data = format_activity_for_frontend_simple(activity, transfer_order, activities, idx)
@@ -3140,32 +3154,72 @@ async def generate_smart_suggestions_for_day(places_service, center_lat, center_
             'any': [1, 2, 3, 4] # Todos los niveles
         }
         
-        # 🎯 Categorías priorizadas por intereses del usuario con ROTACIÓN por día
-        all_categories = []
+        # 🎯 Categorías organizadas por PRIORIDAD: atracciones primero, dining después
+        # Nunca incluir hotel/lodging/accommodation como actividad
+        EXCLUDED_TYPES = {'hotel', 'lodging', 'accommodation', 'motel', 'hostel', 'resort'}
+
+        # Tier 1: Lugares representativos (landmarks, cultura, naturaleza)
+        primary_categories = [
+            'tourist_attraction', 'museum', 'park', 'art_gallery',
+            'church', 'monument', 'beach', 'zoo', 'viewpoint',
+            'natural_feature', 'point_of_interest', 'amusement_park'
+        ]
+
+        # Tier 2: Dining y comercio (solo si no hay suficientes del tier 1)
+        secondary_categories = [
+            'restaurant', 'cafe', 'shopping_mall', 'store',
+            'night_club', 'bar', 'bakery'
+        ]
+
+        # Filtrar por preferencias del usuario manteniendo la prioridad
+        user_primary = []
+        user_secondary = []
+
         if 'tourist_attraction' in interests or 'culture' in str(user_preferences):
-            all_categories.extend(['tourist_attraction', 'point_of_interest', 'museum', 'art_gallery'])
-        if 'restaurant' in interests or 'food' in str(user_preferences):
-            all_categories.extend(['restaurant', 'cafe', 'bakery'])
+            user_primary.extend(['tourist_attraction', 'museum', 'art_gallery', 'monument', 'church'])
         if 'nature' in interests or 'nature' in str(user_preferences):
-            all_categories.extend(['park', 'natural_feature', 'zoo'])
+            user_primary.extend(['park', 'natural_feature', 'zoo', 'beach', 'viewpoint'])
+        if 'restaurant' in interests or 'food' in str(user_preferences):
+            user_secondary.extend(['restaurant', 'cafe', 'bakery'])
         if 'shopping' in interests:
-            all_categories.extend(['shopping_mall', 'store', 'department_store'])
+            user_secondary.extend(['shopping_mall', 'store'])
         if 'nightlife' in interests:
-            all_categories.extend(['night_club', 'bar', 'casino'])
-        
-        # Fallback si no hay preferencias específicas
+            user_secondary.extend(['night_club', 'bar'])
+
+        # Combinar: primero primary, luego secondary (sin duplicados)
+        seen = set()
+        all_categories = []
+        for cat in (user_primary or primary_categories) + (user_secondary or secondary_categories):
+            if cat not in seen and cat not in EXCLUDED_TYPES:
+                all_categories.append(cat)
+                seen.add(cat)
+
+        # Fallback: siempre asegurar atracciones primero
         if not all_categories:
-            all_categories = [
-                'tourist_attraction', 'restaurant', 'point_of_interest', 
-                'museum', 'park', 'art_gallery', 'cafe', 'shopping_mall'
-            ]
-        
-        # 🔄 Rotar categorías según el número del día para crear variedad
-        day_offset = (day_number - 1) * 3  # Cada día usa 3 categorías diferentes
+            all_categories = primary_categories + secondary_categories
+
+        # 🔄 Rotar categorías por día, priorizando siempre atracciones
+        # Cada día toma 3 categorías: al menos 2 del tier primario
+        day_offset = (day_number - 1) * 2
         search_categories = []
-        for i in range(3):  # Solo 3 categorías por día
-            category_index = (day_offset + i) % len(all_categories)
-            search_categories.append(all_categories[category_index])
+
+        # Separar categorías disponibles en primary vs secondary
+        available_primary = [c for c in all_categories if c in set(primary_categories)]
+        available_secondary = [c for c in all_categories if c in set(secondary_categories)]
+
+        # Tomar 2 del primary (rotando) + 1 del secondary (rotando)
+        for i in range(2):
+            if available_primary:
+                idx = (day_offset + i) % len(available_primary)
+                search_categories.append(available_primary[idx])
+        if available_secondary:
+            idx = (day_number - 1) % len(available_secondary)
+            search_categories.append(available_secondary[idx])
+        elif available_primary:
+            # Si no hay secondary, tomar otro primary
+            idx = (day_offset + 2) % len(available_primary)
+            if available_primary[idx] not in search_categories:
+                search_categories.append(available_primary[idx])
         
         logger.info(f"🎲 Día {day_number}: Categorías rotadas = {search_categories}")
         
@@ -3207,12 +3261,24 @@ async def generate_smart_suggestions_for_day(places_service, center_lat, center_
                 )
                 logger.info(f"📊 Google Places API devolvió: {len(real_suggestions)} resultados para {category}")
                 
-                # 🚫 Filtrar lugares ya usados para evitar repeticiones
+                # 🚫 Filtrar lugares ya usados y hoteles/alojamientos
                 filtered_suggestions = []
                 for suggestion in real_suggestions:
                     place_id = suggestion.get('place_id', '')
                     suggestion_name = suggestion.get('name', '').lower()
-                    
+                    suggestion_types = [t.lower() for t in suggestion.get('types', [])]
+
+                    # Excluir hoteles y alojamientos
+                    if any(t in EXCLUDED_TYPES for t in suggestion_types):
+                        logger.info(f"🚫 Excluido (alojamiento): {suggestion.get('name', '')} tipos={suggestion_types}")
+                        continue
+
+                    # Heuristic: excluir por nombre si parece hotel
+                    hotel_keywords = ['hotel', 'hostel', 'hostal', 'motel', 'resort', 'inn ', 'lodge', 'apart hotel']
+                    if any(kw in suggestion_name for kw in hotel_keywords):
+                        logger.info(f"🚫 Excluido (nombre de alojamiento): {suggestion.get('name', '')}")
+                        continue
+
                     # Evitar lugares ya usados por ID o nombre similar
                     if place_id and place_id not in used_place_ids:
                         # También evitar nombres muy similares
@@ -3220,7 +3286,7 @@ async def generate_smart_suggestions_for_day(places_service, center_lat, center_
                             suggestion_name in used_name.lower() or used_name.lower() in suggestion_name
                             for used_name in [p.get('name', '') for p in suggested_places]
                         )
-                        
+
                         if not name_already_used:
                             filtered_suggestions.append(suggestion)
                             used_place_ids.add(place_id)
@@ -3337,16 +3403,16 @@ async def generate_smart_suggestions_for_day(places_service, center_lat, center_
         while len(suggested_places) < 3:
             logger.warning(f"⚠️ Solo {len(suggested_places)} sugerencias encontradas para {day_date}, agregando fallback")
             
-            # 🎲 Crear sugerencias fallback VARIADAS por día para evitar repetición
+            # 🎲 Crear sugerencias fallback VARIADAS por día - priorizar atracciones
             fallback_options = [
-                # Día 1 opciones
-                [("restaurant", "Café parisino tradicional"), ("museum", "Galería de arte local"), ("park", "Jardín urbano cercano")],
-                # Día 2 opciones  
-                [("shopping_mall", "Mercado local típico"), ("tourist_attraction", "Monumento histórico"), ("cafe", "Pastelería artesanal")],
-                # Día 3 opciones
-                [("point_of_interest", "Mirador panorámico"), ("restaurant", "Bistro de barrio"), ("library", "Centro cultural local")],
-                # Día 4+ opciones (ciclar)
-                [("art_gallery", "Espacio creativo"), ("park", "Plaza principal"), ("restaurant", "Cocina regional")]
+                # Día 1: landmarks + cultura
+                [("tourist_attraction", "Monumento principal"), ("museum", "Museo de historia local"), ("park", "Parque central")],
+                # Día 2: naturaleza + mirador
+                [("viewpoint", "Mirador panorámico"), ("beach", "Playa o costanera local"), ("art_gallery", "Galería de arte")],
+                # Día 3: cultura + punto de interés
+                [("church", "Catedral o iglesia histórica"), ("point_of_interest", "Plaza histórica"), ("museum", "Centro cultural")],
+                # Día 4+: naturaleza + atracciones (ciclar)
+                [("park", "Jardín botánico"), ("tourist_attraction", "Sitio emblemático"), ("natural_feature", "Reserva natural")]
             ]
             
             # Seleccionar opciones basadas en día para garantizar variedad
@@ -3414,17 +3480,17 @@ async def generate_smart_suggestions_for_day(places_service, center_lat, center_
             },
             {
                 "id": f"suggested-{day_date}-emergency-2",
-                "name": "Almuerzo local",
-                "category": "restaurant",
+                "name": "Museo o centro cultural",
+                "category": "museum",
                 "rating": 4.0,
                 "image": "",
-                "description": f"Restaurante sugerido para {day_date}",
-                "estimated_time": "1.5h",
-                "priority": 4,
+                "description": f"Museo o centro cultural sugerido para {day_date}",
+                "estimated_time": "2.0h",
+                "priority": 3,
                 "lat": center_lat + 0.001,
                 "lng": center_lon + 0.001,
-                "recommended_duration": "1.5h",
-                "best_time": "12:30-14:00",
+                "recommended_duration": "2.0h",
+                "best_time": "10:30-12:30",
                 "order": 2,
                 "is_intercity": False,
                 "suggested": True,
