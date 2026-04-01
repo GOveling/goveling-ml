@@ -728,102 +728,103 @@ async def calculate_route(request: RoutePointRequest):
 
 # Semantic endpoints moved to routers/semantic.py
 
-@app.get("/cache/stats", tags=["Cache Management"])
-async def get_cache_stats():
-    """Obtener estadísticas del sistema de caché geográfico"""
-    try:
-        from services.google_places_service import GooglePlacesService
-        places_service = GooglePlacesService()
-        
-        stats = places_service.get_cache_stats()
-        
-        return {
-            "success": True,
-            "cache_stats": stats,
-            "recommendations": [
-                f"Hit rate actual: {stats['cache_performance']['hit_rate_percentage']}%",
-                f"Costo ahorrado: ${stats['cache_performance']['estimated_cost_saved_usd']:.3f} USD",
-                "80-90% de reducción esperada con uso continuo"
-            ]
-        }
-        
-    except Exception as e:
-        logger.error(f"Error obteniendo stats de caché: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "cache_stats": None
-        }
+if settings.DEBUG:
+    @app.get("/cache/stats", tags=["Cache Management"])
+    async def get_cache_stats():
+        """Obtener estadísticas del sistema de caché geográfico"""
+        try:
+            from services.google_places_service import GooglePlacesService
+            places_service = GooglePlacesService()
 
-@app.post("/cache/clear", tags=["Cache Management"])
-async def clear_cache(older_than_hours: float = 24.0):
-    """Limpiar caché manualmente"""
-    try:
-        from utils.geographic_cache_manager import get_cache_manager
-        cache_manager = get_cache_manager()
-        
-        cleared_count = cache_manager.clear_cache(older_than_hours=older_than_hours)
-        
-        return {
-            "success": True,
-            "cleared_entries": cleared_count,
-            "message": f"Limpiadas {cleared_count} entradas > {older_than_hours}h"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error limpiando caché: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
+            stats = places_service.get_cache_stats()
 
-@app.get("/debug/suggestions")
-async def debug_suggestions(lat: float = -23.6521, lon: float = -70.3958, day: int = 1):
-    """Debug endpoint para probar sugerencias"""
-    try:
-        from services.google_places_service import GooglePlacesService
-        
-        places_service = GooglePlacesService()
-        
-        # Probar primero el método básico
-        basic_suggestions = await places_service.search_nearby(
-            lat=lat,
-            lon=lon,
-            types=['restaurant', 'tourist_attraction', 'museum'],
-            limit=3
-        )
-        
-        # Probar el método real con Google Places
-        real_suggestions = await places_service.search_nearby_real(
-            lat=lat,
-            lon=lon,
-            types=['restaurant', 'tourist_attraction', 'museum'],
-            limit=3,
-            day_offset=day
-        )
-        
-        return {
-            "location": {"lat": lat, "lon": lon},
-            "day": day,
-            "basic_suggestions": basic_suggestions,
-            "real_suggestions": real_suggestions,
-            "api_key_configured": bool(places_service.api_key),
-            "settings": {
-                "radius": settings.FREE_DAY_SUGGESTIONS_RADIUS_M,
-                "limit": settings.FREE_DAY_SUGGESTIONS_LIMIT,
-                "enable_real_places": settings.ENABLE_REAL_PLACES
+            return {
+                "success": True,
+                "cache_stats": stats,
+                "recommendations": [
+                    f"Hit rate actual: {stats['cache_performance']['hit_rate_percentage']}%",
+                    f"Costo ahorrado: ${stats['cache_performance']['estimated_cost_saved_usd']:.3f} USD",
+                    "80-90% de reducción esperada con uso continuo"
+                ]
             }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in debug/suggestions: {e}", exc_info=True)
-        error_response = {"error": str(e), "error_type": type(e).__name__}
-        if settings.DEBUG:
+
+        except Exception as e:
+            logger.error(f"Error obteniendo stats de caché: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "cache_stats": None
+            }
+
+    @app.post("/cache/clear", tags=["Cache Management"])
+    async def clear_cache(older_than_hours: float = 24.0):
+        """Limpiar caché manualmente"""
+        try:
+            from utils.geographic_cache_manager import get_cache_manager
+            cache_manager = get_cache_manager()
+
+            cleared_count = cache_manager.clear_cache(older_than_hours=older_than_hours)
+
+            return {
+                "success": True,
+                "cleared_entries": cleared_count,
+                "message": f"Limpiadas {cleared_count} entradas > {older_than_hours}h"
+            }
+
+        except Exception as e:
+            logger.error(f"Error limpiando caché: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    @app.get("/debug/suggestions")
+    async def debug_suggestions(lat: float = -23.6521, lon: float = -70.3958, day: int = 1):
+        """Debug endpoint para probar sugerencias"""
+        try:
+            from services.google_places_service import GooglePlacesService
+
+            places_service = GooglePlacesService()
+
+            # Probar primero el método básico
+            basic_suggestions = await places_service.search_nearby(
+                lat=lat,
+                lon=lon,
+                types=['restaurant', 'tourist_attraction', 'museum'],
+                limit=3
+            )
+
+            # Probar el método real con Google Places
+            real_suggestions = await places_service.search_nearby_real(
+                lat=lat,
+                lon=lon,
+                types=['restaurant', 'tourist_attraction', 'museum'],
+                limit=3,
+                day_offset=day
+            )
+
+            return {
+                "location": {"lat": lat, "lon": lon},
+                "day": day,
+                "basic_suggestions": basic_suggestions,
+                "real_suggestions": real_suggestions,
+                "api_key_configured": bool(places_service.api_key),
+                "settings": {
+                    "radius": settings.FREE_DAY_SUGGESTIONS_RADIUS_M,
+                    "limit": settings.FREE_DAY_SUGGESTIONS_LIMIT,
+                    "enable_real_places": settings.ENABLE_REAL_PLACES
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"Error in debug/suggestions: {e}", exc_info=True)
+            error_response = {"error": str(e), "error_type": type(e).__name__}
             import traceback
             error_response["traceback"] = traceback.format_exc()
-        return error_response
+            return error_response
 
 @app.post("/create_itinerary", response_model=ItineraryResponse, tags=["Core"])
+@app.post("/api/v1/itinerary/generate-hybrid", response_model=ItineraryResponse, tags=["Fallback"])
 @app.post("/api/v2/itinerary/generate-hybrid", response_model=ItineraryResponse, tags=["Hybrid Optimizer"])
 @cache_result(expiry_minutes=5)  # 5 minutos de caché
 async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
@@ -975,24 +976,9 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
                 logger.error(f"❌ Error normalizando lugar {i}: {e}")
                 logger.error(f"   Tipo de objeto: {type(place)}")
                 logger.error(f"   Contenido: {place}")
-                # Continuar con lugar mínimo válido
-                normalized_places.append({
-                    'place_id': f"error_place_{i}",
-                    'name': f"Lugar {i+1}",
-                    'lat': 0.0,
-                    'lon': 0.0,
-                    'category': 'general',
-                    'type': 'point_of_interest',
-                    'rating': 0.0,
-                    'price_level': 0,
-                    'address': 'Dirección no disponible',
-                    'description': 'Lugar con información limitada',
-                    'photos': [],
-                    'opening_hours': {},
-                    'website': '',
-                    'phone': '',
-                    'priority': 5
-                })
+                # Skip places that fail normalization instead of inserting at (0,0)
+                # which would distort the entire itinerary routing
+                logger.warning(f"   ⚠️ Lugar {i} descartado por error de normalización")
         
         # 🏨 DETECCIÓN Y RECOMENDACIÓN AUTOMÁTICA DE ACCOMMODATIONS
         # 1. Detectar si hay accommodations en places ORIGINALES
