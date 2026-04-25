@@ -21,6 +21,7 @@ from services.hotel_recommender import HotelRecommender
 from services.google_places_service import GooglePlacesService
 from services.multi_city_optimizer_simple import MultiCityOptimizerSimple
 from services.city_clustering_service import CityClusteringService
+from services.dwell_stats_service import build_for_places as build_dwell_stats_lookup
 from utils.logging_config import setup_production_logging
 from utils.performance_cache import cache_result, hash_places, cleanup_expired_cache
 from utils.hybrid_optimizer_v31 import HybridOptimizerV31
@@ -888,18 +889,24 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
             )
         
         # 🔧 Normalizar lugares con campos faltantes
+        # Pre-fetch learned dwell stats once per request. Empty lookup if
+        # Supabase isn't configured or the call fails — see dwell_stats_service.
+        raw_place_dicts = []
+        for place in request.places:
+            if hasattr(place, 'model_dump'):
+                raw_place_dicts.append(place.model_dump())
+            elif hasattr(place, 'dict'):
+                raw_place_dicts.append(place.dict())
+            elif hasattr(place, '__dict__'):
+                raw_place_dicts.append(place.__dict__)
+            else:
+                raw_place_dicts.append(place)
+        dwell_lookup = await build_dwell_stats_lookup(raw_place_dicts)
+
         normalized_places = []
         for i, place in enumerate(request.places):
             try:
-                # Manejo correcto de conversión para Pydantic v2
-                if hasattr(place, 'model_dump'):
-                    place_dict = place.model_dump()
-                elif hasattr(place, 'dict'):
-                    place_dict = place.dict()
-                elif hasattr(place, '__dict__'):
-                    place_dict = place.__dict__
-                else:
-                    place_dict = place
+                place_dict = raw_place_dicts[i]
                 
                 # Solo log esencial en producción
                 if settings.DEBUG:
@@ -951,11 +958,35 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
                     quality_flag = "user_provided_below_threshold"
                     logger.info(f"⚠️ Lugar con rating bajo: {place_dict.get('name', 'lugar')} ({rating_value}⭐) - marcado como user_provided")
                 
+                # Duration fallback pyramid:
+                #   1. user-supplied duration_minutes (or min_duration_hours * 60)
+                #   2. place_dwell_stats.p50 for this Google place_id
+                #   3. category_dwell_stats.p50 for (category, geohash5)
+                #   4. hardcoded calculate_visit_duration map
+                lat_value = safe_float(place_dict.get('lat'))
+                lon_value = safe_float(place_dict.get('lon'))
+                user_duration = place_dict.get('duration_minutes')
+                if user_duration is None and place_dict.get('min_duration_hours') is not None:
+                    user_duration = int(round(float(place_dict['min_duration_hours']) * 60))
+                if user_duration is not None:
+                    duration_minutes = max(1, int(user_duration))
+                else:
+                    learned = dwell_lookup.lookup(
+                        place_id=(place_dict.get('id')
+                                  or place_dict.get('google_place_id')
+                                  or place_dict.get('place_id')),
+                        category=category_value,
+                        lat=lat_value,
+                        lon=lon_value,
+                    )
+                    duration_minutes = learned if learned is not None \
+                        else calculate_visit_duration(type_value)
+
                 normalized_place = {
                     'place_id': place_dict.get('place_id') or place_dict.get('id') or f"place_{i}",
                     'name': safe_str(place_dict.get('name'), f"Lugar {i+1}"),
-                    'lat': safe_float(place_dict.get('lat')),
-                    'lon': safe_float(place_dict.get('lon')),
+                    'lat': lat_value,
+                    'lon': lon_value,
                     'category': category_value,
                     'type': type_value,
                     'rating': rating_value,
@@ -967,6 +998,7 @@ async def generate_hybrid_itinerary_endpoint(request: ItineraryRequest):
                     'website': safe_str(place_dict.get('website')),
                     'phone': safe_str(place_dict.get('phone')),
                     'priority': max(1, min(10, safe_int(place_dict.get('priority'), 5))),
+                    'duration_minutes': duration_minutes,
                     'quality_flag': quality_flag  # Agregar quality flag
                 }
                 
@@ -2682,9 +2714,15 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
         
         # Normalizar lugares de entrada — separar alojamientos de actividades
         LODGING_TYPES = {'hotel', 'lodging', 'accommodation', 'motel', 'hostel', 'resort'}
+        # Pre-fetch learned dwell stats once per request (see dwell_stats_service).
+        raw_place_dicts = [
+            (place.dict() if hasattr(place, 'dict') else place)
+            for place in request.places
+        ]
+        dwell_lookup = await build_dwell_stats_lookup(raw_place_dicts)
+
         normalized_places = []
-        for place in request.places:
-            place_dict = place.dict() if hasattr(place, 'dict') else place
+        for place_dict in raw_place_dicts:
             place_type = (place_dict.get('type') or place_dict.get('category') or '').lower()
 
             # Hotels go as accommodation, never as activity POIs
@@ -2693,8 +2731,24 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
                 place_dict['place_type'] = 'accommodation'
                 logger.info(f"🏨 Marcado como alojamiento (no actividad): {place_dict.get('name', 'N/A')}")
 
-            place_dict['duration_minutes'] = place_dict.get('duration_minutes',
-                                                          calculate_visit_duration(place_dict.get('type', 'point_of_interest')))
+            # Duration fallback pyramid: user input → learned dwell stats →
+            # hardcoded duration_map. Same logic as the v2 endpoint above.
+            existing = place_dict.get('duration_minutes')
+            if existing is None and place_dict.get('min_duration_hours') is not None:
+                existing = int(round(float(place_dict['min_duration_hours']) * 60))
+            if existing is not None:
+                place_dict['duration_minutes'] = max(1, int(existing))
+            else:
+                learned = dwell_lookup.lookup(
+                    place_id=(place_dict.get('id')
+                              or place_dict.get('google_place_id')
+                              or place_dict.get('place_id')),
+                    category=(place_dict.get('category') or place_dict.get('type')),
+                    lat=place_dict.get('lat'),
+                    lon=place_dict.get('lon'),
+                )
+                place_dict['duration_minutes'] = learned if learned is not None \
+                    else calculate_visit_duration(place_dict.get('type', 'point_of_interest'))
             normalized_places.append(place_dict)
         
         # 🆕 Crear mapa de horarios personalizados por fecha

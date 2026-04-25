@@ -62,6 +62,13 @@ class Settings(BaseSettings):
     GOOGLE_PLACES_API_KEY: Optional[str] = os.getenv("GOOGLE_PLACES_API_KEY")
     OPENAI_API_KEY: Optional[str] = None
     ENABLE_REAL_PLACES: bool = os.getenv("ENABLE_REAL_PLACES", "true").lower() == "true"
+
+    # Supabase — used by DwellStatsLookup (services/dwell_stats_service.py) to
+    # read learned per-place / per-category dwell-time percentiles. Both vars
+    # optional; lookup degrades to hardcoded duration_map when absent so local
+    # dev / tests work without Supabase access.
+    SUPABASE_URL: Optional[str] = os.getenv("SUPABASE_URL")
+    SUPABASE_ANON_KEY: Optional[str] = os.getenv("SUPABASE_ANON_KEY")
     
     # Free Routing APIs (alternativas gratuitas a Google Directions)
     OPENROUTE_API_KEY: Optional[str] = os.getenv('OPENROUTE_API_KEY', None)  # Obtener clave gratuita en openrouteservice.org
