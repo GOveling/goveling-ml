@@ -5,7 +5,7 @@ AI-powered itinerary optimization service using Google OR-Tools for TSP/VRP prob
 
 - **Framework**: FastAPI (Python 3.11+)
 - **Optimization**: Google OR-Tools 9.8+ (TSP/VRP), scikit-learn, networkx
-- **Production**: `https://goveling-ml.onrender.com`
+- **Production**: `https://goveling-ml-90fb.onrender.com`
 - **Port**: 8000
 
 ## Project Structure
