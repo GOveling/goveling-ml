@@ -2777,9 +2777,30 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
         decision = await should_use_city2graph(request)
         use_ortools = decision.get('use_city2graph', False)
         complexity_score = decision.get('complexity_score', 0.0)
-        
+
         logger.info(f"🧠 Decisión algoritmo: {'ORTools' if use_ortools else 'Legacy'} (score: {complexity_score})")
-        
+
+        # 🏨 (Fase 2.5) Override: si el trip trae stays con check_in/check_out,
+        # forzamos el path legacy híbrido. Razón:
+        #   1. El path OR-Tools actual no incorpora anchoring por fecha
+        #      (su optimizer es single-day TSP/VRP).
+        #   2. El path legacy híbrido SÍ aplica `reanchor_clusters_by_dates`
+        #      cuando hay stays fechados (Fase 2).
+        # El override es no-op para clientes legacy sin fechas en stays,
+        # así que no degrada ningún comportamiento previo.
+        has_dated_stays = any(
+            getattr(a, 'check_in', None) is not None
+            and getattr(a, 'check_out', None) is not None
+            for a in (request.accommodations or [])
+        )
+        if has_dated_stays and use_ortools:
+            logger.info(
+                "🏨 Override Fase 2.5: stays con fechas detectadas → "
+                "forzando path legacy híbrido para aprovechar date-anchoring "
+                f"(complexity_score={complexity_score} ignorado)"
+            )
+            use_ortools = False
+
         if use_ortools and settings.ENABLE_ORTOOLS:
             # 🚀 USAR ORTools para casos complejos (multi-ciudad, rutas largas)
             logger.info(f"🚀 Usando ORTools para optimización avanzada")
