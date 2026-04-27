@@ -3396,6 +3396,152 @@ class HybridOptimizerV31:
         }
 
 # =========================================================================
+# DATE-ANCHORED STAYS (Fase 2)
+# =========================================================================
+
+def build_date_anchor_map(
+    accommodations: Optional[List[Dict]],
+    start_date: datetime,
+    end_date: datetime,
+) -> Dict[str, Optional[Dict]]:
+    """
+    Construir mapa fecha→hospedaje desde stays con check_in/check_out.
+
+    Convención hotelera: check_in inclusivo, check_out exclusivo.
+    Por ejemplo, check_in=2026-05-01 / check_out=2026-05-03 cubre 2 noches
+    (fechas anclas: 2026-05-01 y 2026-05-02).
+
+    Devuelve {YYYY-MM-DD: accommodation_dict | None} para cada día del
+    viaje. None significa "gap" (transición, sin hospedaje).
+
+    Si una fecha está cubierta por múltiples stays (overlap), gana el de
+    mayor `rating`, y como tiebreaker el primero por orden de inserción.
+
+    Stays sin check_in o check_out se ignoran completamente (no aportan
+    información temporal).
+    """
+    anchor_map: Dict[str, Optional[Dict]] = {}
+    cursor = start_date
+    while cursor <= end_date:
+        anchor_map[cursor.strftime('%Y-%m-%d')] = None
+        cursor += timedelta(days=1)
+
+    if not accommodations:
+        return anchor_map
+
+    def _parse(d) -> Optional[datetime]:
+        if d is None:
+            return None
+        if isinstance(d, datetime):
+            return d
+        if isinstance(d, str):
+            try:
+                return datetime.strptime(d, '%Y-%m-%d')
+            except ValueError:
+                return None
+        # Pydantic `date` instances expose isoformat
+        try:
+            return datetime.strptime(d.isoformat(), '%Y-%m-%d')
+        except Exception:
+            return None
+
+    for acc in accommodations:
+        ci_raw = acc.get('check_in') if isinstance(acc, dict) else getattr(acc, 'check_in', None)
+        co_raw = acc.get('check_out') if isinstance(acc, dict) else getattr(acc, 'check_out', None)
+        ci = _parse(ci_raw)
+        co = _parse(co_raw)
+        if ci is None or co is None or co <= ci:
+            continue
+
+        cursor = ci
+        while cursor < co:
+            key = cursor.strftime('%Y-%m-%d')
+            if key in anchor_map:
+                existing = anchor_map[key]
+                if existing is None:
+                    anchor_map[key] = acc
+                else:
+                    # Tiebreaker: rating más alto gana; si empate, mantener el existente
+                    new_rating = (acc.get('rating') if isinstance(acc, dict) else getattr(acc, 'rating', None)) or 0
+                    cur_rating = (existing.get('rating') if isinstance(existing, dict) else getattr(existing, 'rating', None)) or 0
+                    if new_rating > cur_rating:
+                        anchor_map[key] = acc
+            cursor += timedelta(days=1)
+
+    return anchor_map
+
+
+def reanchor_clusters_by_dates(
+    day_assignments: Dict[str, List['Cluster']],
+    anchor_map: Dict[str, Optional[Dict]],
+) -> Dict[str, List['Cluster']]:
+    """
+    Override `cluster.home_base` por anchor de fecha cuando exista.
+
+    Para cada cluster en `day_assignments[date_str]`, si `anchor_map[date_str]`
+    tiene un hospedaje con coordenadas, override `home_base` y marca
+    `home_base_source = "stay_dated"`.
+
+    Idempotente: clusters ya alineados con su anchor (mismo lat/lon) no se
+    tocan. No-op total si ningún anchor tiene fechas (anchor_map todo None).
+
+    Importante: el optimizador legacy puede asignar el mismo `Cluster` a
+    múltiples días (mini-clusters compartidos en relaxed mode). En ese caso,
+    si los días tienen stays distintos, clonamos el cluster por día para
+    evitar pisar `home_base`.
+    """
+    if not any(anchor_map.values()):
+        return day_assignments
+
+    EPS = 1e-4  # ≈ 11m, suficiente para detectar coordenadas distintas
+
+    new_assignments: Dict[str, List['Cluster']] = {}
+    for date_str, clusters in day_assignments.items():
+        anchor = anchor_map.get(date_str)
+        if not anchor or not clusters:
+            new_assignments[date_str] = clusters
+            continue
+
+        a_lat = anchor.get('lat') if isinstance(anchor, dict) else getattr(anchor, 'lat', None)
+        a_lon = anchor.get('lon') if isinstance(anchor, dict) else getattr(anchor, 'lon', None)
+        if a_lat is None or a_lon is None:
+            new_assignments[date_str] = clusters
+            continue
+
+        # Normalizar el anchor a dict para uso uniforme aguas abajo
+        anchor_dict = anchor if isinstance(anchor, dict) else (
+            anchor.dict() if hasattr(anchor, 'dict') else anchor.__dict__
+        )
+
+        rebuilt: List['Cluster'] = []
+        for cluster in clusters:
+            cur_base = cluster.home_base
+            already_aligned = (
+                cur_base is not None
+                and abs((cur_base.get('lat') or 0) - a_lat) < EPS
+                and abs((cur_base.get('lon') or 0) - a_lon) < EPS
+            )
+            if already_aligned:
+                rebuilt.append(cluster)
+                continue
+
+            # Clonar para no mutar otras referencias del mismo cluster
+            cloned = Cluster(
+                label=cluster.label,
+                centroid=cluster.centroid,
+                places=cluster.places,
+                home_base=anchor_dict.copy(),
+                home_base_source="stay_dated",
+                suggested_accommodations=cluster.suggested_accommodations,
+                additional_suggestions=cluster.additional_suggestions,
+            )
+            rebuilt.append(cloned)
+        new_assignments[date_str] = rebuilt
+
+    return new_assignments
+
+
+# =========================================================================
 # MAIN FUNCTION V3.1
 # =========================================================================
 
@@ -3703,7 +3849,18 @@ async def _optimize_classic_method(
     
     # 3. Allocate clusters to days
     day_assignments = optimizer.allocate_clusters_to_days(clusters, start_date, end_date)
-    
+
+    # 3b. 🆕 (Fase 2) Re-anclar home_base por fecha si las stays traen
+    # check_in/check_out. No-op si no hay stays con fechas.
+    anchor_map = build_date_anchor_map(accommodations, start_date, end_date)
+    dated_anchors = sum(1 for v in anchor_map.values() if v is not None)
+    if dated_anchors > 0:
+        logging.info(
+            f"🏨 Date-anchoring activo: {dated_anchors}/{len(anchor_map)} días "
+            f"con hospedaje fechado (override por proximidad legacy)"
+        )
+        day_assignments = reanchor_clusters_by_dates(day_assignments, anchor_map)
+
     # 4. Apply packing strategy
     day_assignments = optimizer.pack_activities_by_strategy(day_assignments, packing_strategy)
     

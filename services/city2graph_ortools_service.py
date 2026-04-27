@@ -398,20 +398,25 @@ class City2GraphORToolsService:
         
         # Extraer datos del request para OR-Tools
         places = request.get("places", [])
-        accommodations = request.get("accommodations", [])  # ✅ AÑADIDO: accommodations
-        start_date = request.get("start_date", "2024-11-15")
-        end_date = request.get("end_date", "2024-11-15")
+        # NOTE (Fase 2.5 pendiente): accommodations con check_in/check_out se
+        # extraen aquí pero NO se reenvían al optimizer todavía. La firma de
+        # `optimize_itinerary_advanced` es single-day y no acepta este kwarg
+        # (lanzaba TypeError). El anclaje por fecha en el path OR-Tools
+        # requiere una refactor multi-día separada — ver Fase 2.5.
+        accommodations = request.get("accommodations", [])
         preferences = request.get("preferences", {})
-        
+
         # Obtener matriz de distancias
         logger.info(f"🗺️ Getting distance matrix for {len(places)} places")
         distance_matrix = await self.get_distance_matrix(places)
-        
+
         # Ejecutar optimización con parámetros correctos
-        logger.info(f"🧮 Executing OR-Tools optimization with pois={len(places)}, accommodations={len(accommodations)}")
+        logger.info(
+            f"🧮 Executing OR-Tools optimization with pois={len(places)}, "
+            f"accommodations_received={len(accommodations)} (date-anchoring TODO Fase 2.5)"
+        )
         result = self.ortools_optimizer.optimize_itinerary_advanced(
             pois=places,  # Parámetro correcto: pois, no places
-            accommodations=accommodations,  # ✅ AÑADIDO: accommodations
             distance_matrix=distance_matrix,  # Matriz de distancias requerida
             use_time_windows=True,
             start_time=f"{preferences.get('daily_start_hour', 9):02d}:00"

@@ -205,6 +205,39 @@ class Activity(BaseModel):
     priority: int
     coordinates: Coordinates
 
+class Accommodation(Place):
+    """
+    Hospedaje fechado para anclar la optimización día a día.
+
+    Extiende `Place` con `check_in` / `check_out` (convención hotelera:
+    check_in inclusivo, check_out exclusivo). Ambos campos son opcionales
+    para mantener compatibilidad con clientes legacy que enviaban una lista
+    plana de `Place` sin fechas — en ese caso el optimizador cae al
+    comportamiento previo (sin anclaje día a día).
+    """
+    check_in: Optional[date] = Field(default=None, description="Check-in YYYY-MM-DD (inclusive)")
+    check_out: Optional[date] = Field(default=None, description="Check-out YYYY-MM-DD (exclusive)")
+
+    @field_validator('check_in', 'check_out', mode='before')
+    @classmethod
+    def validate_stay_dates(cls, v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, str):
+            try:
+                return datetime.strptime(v, '%Y-%m-%d').date()
+            except ValueError as e:
+                raise ValueError(f'Formato de fecha inválido. Debe ser YYYY-MM-DD: {str(e)}')
+        return v
+
+    @model_validator(mode='after')
+    def check_dates_consistent(self):
+        # Solo validar si ambas fechas están presentes; ausencia es válida.
+        if self.check_in is not None and self.check_out is not None:
+            if self.check_out <= self.check_in:
+                raise ValueError('check_out debe ser posterior a check_in')
+        return self
+
 class ItineraryRequest(BaseModel):
     places: List[Place] = Field(..., min_items=0, max_items=50)  # 🆕 Permitir días libres (min_items=0)
     start_date: Union[date, str]
@@ -216,7 +249,7 @@ class ItineraryRequest(BaseModel):
     max_walking_distance_km: Optional[float] = Field(default=15.0, ge=1, le=50)
     max_daily_activities: int = Field(default=6, ge=1, le=10)
     preferences: Optional[Dict] = Field(default_factory=dict)
-    accommodations: Optional[List[Place]] = Field(default_factory=list)
+    accommodations: Optional[List[Accommodation]] = Field(default_factory=list)
 
     @field_validator('transport_mode', mode='before')
     @classmethod
