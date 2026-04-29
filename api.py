@@ -2750,7 +2750,22 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
                 place_dict['duration_minutes'] = learned if learned is not None \
                     else calculate_visit_duration(place_dict.get('type', 'point_of_interest'))
             normalized_places.append(place_dict)
-        
+
+        # Normalize accommodations to plain dicts. Downstream optimizers
+        # (hybrid_optimizer_v31, hotel_recommender, ortools_service) expect
+        # subscript access (`acc['lat']`, `acc['city']`, etc.). Pydantic v2
+        # `Accommodation` instances are NOT subscriptable, so leaving them as
+        # model objects raised `'Accommodation' object is not subscriptable`
+        # and crashed the multi-modal endpoint with a 500.
+        normalized_accommodations = []
+        for acc in (request.accommodations or []):
+            if hasattr(acc, 'model_dump'):
+                normalized_accommodations.append(acc.model_dump())
+            elif hasattr(acc, 'dict'):
+                normalized_accommodations.append(acc.dict())
+            else:
+                normalized_accommodations.append(acc)
+
         # 🆕 Crear mapa de horarios personalizados por fecha
         custom_schedule_map = {}
         if request.custom_schedules:
@@ -2788,10 +2803,11 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
         #      cuando hay stays fechados (Fase 2).
         # El override es no-op para clientes legacy sin fechas en stays,
         # así que no degrada ningún comportamiento previo.
+        # Operate on the normalized dict list — `getattr` would silently
+        # return None on a dict and the override below would never trigger.
         has_dated_stays = any(
-            getattr(a, 'check_in', None) is not None
-            and getattr(a, 'check_out', None) is not None
-            for a in (request.accommodations or [])
+            a.get('check_in') is not None and a.get('check_out') is not None
+            for a in normalized_accommodations
         )
         if has_dated_stays and use_ortools:
             logger.info(
@@ -2817,7 +2833,7 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
                     'daily_start_hour': request.daily_start_hour,
                     'daily_end_hour': request.daily_end_hour,
                     'transport_mode': str(request.transport_mode),
-                    'accommodations': request.accommodations or [],
+                    'accommodations': normalized_accommodations,
                     'preferences': request.preferences or {},
                     'max_walking_distance_km': request.max_walking_distance_km,
                     'max_daily_activities': request.max_daily_activities
@@ -2847,7 +2863,7 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
             request.daily_start_hour,
             request.daily_end_hour,
             request.transport_mode,
-            request.accommodations or [],
+            normalized_accommodations,
             "balanced",  # packing_strategy
             extra_info
         )
