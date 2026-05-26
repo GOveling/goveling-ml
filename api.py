@@ -499,6 +499,46 @@ async def health_check():
         "version": "2.2.0"
     }
 
+
+_SERVICE_STARTED_AT = time_module.time()
+
+
+@app.get("/healthz")
+async def healthz():
+    """
+    Detailed health probe consumed by the public status page
+    (status.goveling.com). Reports uptime, dependency availability
+    (OR-Tools, hybrid routing service) and runtime info.
+    """
+    import sys
+
+    # OR-Tools availability — the optimizer falls back to greedy if missing
+    try:
+        from ortools.constraint_solver import pywrapcp  # noqa: F401
+        ortools_available = True
+    except Exception:
+        ortools_available = False
+
+    # Hybrid routing service is lazy-initialized; report whichever state
+    # we observe without forcing init.
+    routing_ready = hybrid_routing_service is not None
+
+    return {
+        "status": "ok",
+        "service": "goveling-ml",
+        "version": "2.2.0",
+        "timestamp": datetime.now().isoformat(),
+        "uptime_seconds": int(time_module.time() - _SERVICE_STARTED_AT),
+        "runtime": {
+            "python": sys.version.split()[0],
+            "platform": sys.platform,
+        },
+        "dependencies": {
+            "ortools": ortools_available,
+            "hybrid_routing": routing_ready,
+        },
+    }
+
 # ========================================================================
 # 🧠 CITY2GRAPH TESTING ENDPOINTS - FASE 1 (PARA VALIDACIÓN)
 # ========================================================================
