@@ -424,9 +424,68 @@ class City2GraphORToolsService:
         
         if not result:
             raise Exception("OR-Tools returned empty result")
-        
-        logger.info(f"✅ OR-Tools optimization completed successfully")
-        return result
+
+        if not result.get("success"):
+            raise Exception(f"OR-Tools solver failed: {result.get('error', 'unknown')}")
+
+        # ── Adaptar output TSP single-day → formato multi-día esperado por el endpoint ──
+        # OR-Tools devuelve la ruta óptima global; la distribuimos en días según
+        # max_daily_activities y las fechas del request.
+        from datetime import date as date_type, timedelta
+
+        ordered_pois = result.get("optimized_pois", [])
+        max_per_day = int(request.get("max_daily_activities", 6))
+
+        start_str = request.get("start_date", "")
+        end_str   = request.get("end_date", "")
+        try:
+            start_d = date_type.fromisoformat(start_str[:10])
+            end_d   = date_type.fromisoformat(end_str[:10])
+        except (ValueError, TypeError):
+            start_d = date_type.today()
+            end_d   = start_d
+
+        total_days = (end_d - start_d).days + 1
+        days = []
+        poi_idx = 0
+
+        for day_num in range(total_days):
+            current_date = (start_d + timedelta(days=day_num)).isoformat()
+            day_pois = ordered_pois[poi_idx: poi_idx + max_per_day]
+            poi_idx += max_per_day
+
+            places_out = []
+            for p in day_pois:
+                places_out.append({
+                    "id":       p.get("id", ""),
+                    "name":     p.get("name", ""),
+                    "lat":      p.get("lat", 0.0),
+                    "lng":      p.get("lon", p.get("lng", 0.0)),
+                    "category": p.get("category", p.get("type", "point_of_interest")),
+                    "priority": p.get("priority", 5),
+                    "duration_minutes": p.get("duration_minutes", 60),
+                })
+
+            days.append({
+                "date":   current_date,
+                "places": places_out,
+                "metrics": {
+                    "distance_m":  result.get("total_distance_km", 0) * 1000 / max(total_days, 1),
+                    "duration_s":  result.get("total_time_minutes", 0) * 60  / max(total_days, 1),
+                },
+            })
+
+        adapted = {
+            "days": days,
+            "total_distance_km":    result.get("total_distance_km", 0),
+            "total_time_minutes":   result.get("total_time_minutes", 0),
+            "algorithm_used":       result.get("algorithm_used", "ortools"),
+            "constraints_satisfied": result.get("constraints_satisfied", True),
+            "dropped_pois":         result.get("dropped_pois", []),
+        }
+
+        logger.info(f"✅ OR-Tools optimization completed: {len(ordered_pois)} POIs → {total_days} days")
+        return adapted
     
     def _generate_metrics(self, result: Dict, execution_time: float, request: Dict) -> ORToolsMetrics:
         """Generar métricas de performance vs benchmarks"""
