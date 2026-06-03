@@ -545,7 +545,7 @@ async def healthz():
 
 @app.get("/debug/ortools-test")
 async def debug_ortools_test():
-    """Diagnóstico: llama OR-Tools directamente y devuelve error o resultado"""
+    """Diagnóstico: llama OR-Tools con 8 lugares (mismo escenario que el endpoint real)"""
     import traceback
     try:
         from services.city2graph_ortools_service import get_ortools_service
@@ -554,22 +554,27 @@ async def debug_ortools_test():
         if not healthy:
             status = svc.get_service_status()
             return {"healthy": False, "service_status": status}
+        # Simular normalized_places como los produce el endpoint real
         test_places = [
-            {"id":"1","name":"Plaza Armas","lat":-33.4372,"lon":-70.6506,"priority":8,"duration_minutes":60},
-            {"id":"2","name":"Cerro Santa Lucia","lat":-33.4413,"lon":-70.6445,"priority":7,"duration_minutes":60},
-            {"id":"3","name":"Mercado Central","lat":-33.4283,"lon":-70.6483,"priority":6,"duration_minutes":60},
-            {"id":"4","name":"Cerro San Cristobal","lat":-33.4244,"lon":-70.6363,"priority":9,"duration_minutes":60},
+            {"id":"1","name":"Plaza de Armas","lat":-33.4372,"lon":-70.6506,"priority":8,"duration_minutes":90,"category":None,"type":None,"rating":None},
+            {"id":"2","name":"Cerro Santa Lucía","lat":-33.4413,"lon":-70.6445,"priority":7,"duration_minutes":60,"category":None,"type":None,"rating":None},
+            {"id":"3","name":"Mercado Central","lat":-33.4283,"lon":-70.6483,"priority":6,"duration_minutes":60,"category":None,"type":None,"rating":None},
+            {"id":"4","name":"Cerro San Cristóbal","lat":-33.4244,"lon":-70.6363,"priority":9,"duration_minutes":120,"category":None,"type":None,"rating":None},
+            {"id":"5","name":"Museo Arte Precolombino","lat":-33.4385,"lon":-70.6512,"priority":5,"duration_minutes":90,"category":None,"type":None,"rating":None},
+            {"id":"6","name":"Barrio Italia","lat":-33.4490,"lon":-70.6270,"priority":7,"duration_minutes":60,"category":None,"type":None,"rating":None},
+            {"id":"7","name":"La Chascona","lat":-33.4277,"lon":-70.6388,"priority":8,"duration_minutes":60,"category":None,"type":None,"rating":None},
+            {"id":"8","name":"Parque Forestal","lat":-33.4361,"lon":-70.6423,"priority":6,"duration_minutes":60,"category":None,"type":None,"rating":None},
         ]
         req = {
             "places": test_places,
             "start_date": "2026-06-05",
-            "end_date": "2026-06-06",
+            "end_date": "2026-06-07",
             "daily_start_hour": 9,
             "daily_end_hour": 19,
-            "transport_mode": "driving",
+            "transport_mode": "TransportMode.driving",
             "accommodations": [],
             "preferences": {},
-            "max_walking_distance_km": 15,
+            "max_walking_distance_km": 15.0,
             "max_daily_activities": 6,
         }
         result = await svc.optimize_with_ortools(req)
@@ -2924,7 +2929,8 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
                 optimization_result['decision_factors'] = decision.get('factors', {})
                     
             except Exception as e:
-                logger.warning(f"⚠️ ORTools falló, usando fallback: {e}")
+                import traceback as _tb
+                logger.warning(f"⚠️ ORTools falló, usando fallback: {e}\n{_tb.format_exc()}")
                 use_ortools = False
         
         if not use_ortools:
