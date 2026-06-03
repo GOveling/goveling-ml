@@ -543,6 +543,40 @@ async def healthz():
 # 🧠 CITY2GRAPH TESTING ENDPOINTS - FASE 1 (PARA VALIDACIÓN)
 # ========================================================================
 
+@app.get("/debug/ortools-test")
+async def debug_ortools_test():
+    """Diagnóstico: llama OR-Tools directamente y devuelve error o resultado"""
+    import traceback
+    try:
+        from services.city2graph_ortools_service import get_ortools_service
+        svc = await get_ortools_service()
+        healthy = await svc.is_healthy()
+        if not healthy:
+            status = svc.get_service_status()
+            return {"healthy": False, "service_status": status}
+        test_places = [
+            {"id":"1","name":"Plaza Armas","lat":-33.4372,"lon":-70.6506,"priority":8,"duration_minutes":60},
+            {"id":"2","name":"Cerro Santa Lucia","lat":-33.4413,"lon":-70.6445,"priority":7,"duration_minutes":60},
+            {"id":"3","name":"Mercado Central","lat":-33.4283,"lon":-70.6483,"priority":6,"duration_minutes":60},
+            {"id":"4","name":"Cerro San Cristobal","lat":-33.4244,"lon":-70.6363,"priority":9,"duration_minutes":60},
+        ]
+        req = {
+            "places": test_places,
+            "start_date": "2026-06-05",
+            "end_date": "2026-06-06",
+            "daily_start_hour": 9,
+            "daily_end_hour": 19,
+            "transport_mode": "driving",
+            "accommodations": [],
+            "preferences": {},
+            "max_walking_distance_km": 15,
+            "max_daily_activities": 6,
+        }
+        result = await svc.optimize_with_ortools(req)
+        return {"healthy": True, "result_keys": list(result.keys()), "days_count": len(result.get("days", []))}
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
 @app.get("/city2graph/config")
 async def get_city2graph_config():
     """Obtener configuración actual de City2Graph (para debugging)"""
