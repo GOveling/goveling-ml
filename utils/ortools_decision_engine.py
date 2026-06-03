@@ -385,15 +385,23 @@ class ORToolsDecisionEngine:
         
         if detected_city:
             city_lower = detected_city.lower()
-            
-            # Check exclusiones primero
+
+            # Synthetic cluster IDs produced by _detect_city when no named city
+            # is available (e.g. "multi_city_2_clusters", "city_cluster_-33.44_-70.65",
+            # "location_...", "single_location").  These are not real city names so
+            # they will never appear in allowed_cities — skip the allowlist check and
+            # let OR-Tools run.  Exclusions still apply if the raw name matches.
+            _SYNTHETIC_PREFIXES = ("multi_city_", "city_cluster_", "location_", "single_location")
+            is_synthetic = any(city_lower.startswith(p) for p in _SYNTHETIC_PREFIXES)
+
+            # Check exclusiones primero (applies even for synthetic IDs)
             if city_lower in excluded_cities:
                 return False
-            
-            # Check inclusiones
-            if allowed_cities and city_lower not in allowed_cities:
+
+            # Check inclusiones — skip for synthetic IDs (can't name-match a cluster)
+            if allowed_cities and not is_synthetic and city_lower not in allowed_cities:
                 return False
-        
+
         return True
     
     def _detect_city(self, request_data: Dict) -> Optional[str]:
