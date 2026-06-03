@@ -2827,7 +2827,7 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
                     lon=place_dict.get('lon'),
                 )
                 place_dict['duration_minutes'] = learned if learned is not None \
-                    else calculate_visit_duration(place_dict.get('type', 'point_of_interest'))
+                    else calculate_visit_duration(place_dict.get('type') or 'point_of_interest')
             normalized_places.append(place_dict)
 
         # Normalize accommodations to plain dicts. Downstream optimizers
