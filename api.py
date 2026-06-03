@@ -3050,10 +3050,18 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
                 "actionable_recommendations": day.get("actionable_recommendations", []),
                 "schedule_info": day.get("schedule_info")  # 🆕 Preservar horarios personalizados
             }
-            
+
+            # Inject city into base by parsing from address field.
+            # e.g. "Av. Santa María 123, Valparaíso, Chile" → "Valparaíso"
+            base_obj = day_data.get("base")
+            if isinstance(base_obj, dict) and not base_obj.get("city"):
+                parts = [p.strip() for p in (base_obj.get("address") or "").split(",")]
+                if len(parts) >= 2:
+                    base_obj["city"] = parts[-2]
+
             itinerary_days.append(day_data)
             day_counter += 1
-        
+
         # Calcular métricas finales
         optimization_metrics = optimization_result.get('optimization_metrics', {})
         total_activities = sum(len(day['places']) for day in itinerary_days)
