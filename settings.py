@@ -139,7 +139,7 @@ class Settings(BaseSettings):
     # ========================================================================
     
     # Master switch
-    ENABLE_CITY2GRAPH: bool = _safe_bool("ENABLE_CITY2GRAPH", False)
+    ENABLE_CITY2GRAPH: bool = _safe_bool("ENABLE_CITY2GRAPH", True)
 
     # Criterios de activacion
     CITY2GRAPH_MIN_PLACES: int = _safe_int("CITY2GRAPH_MIN_PLACES", 8)
@@ -172,7 +172,7 @@ class Settings(BaseSettings):
     # ========================================================================
     
     # Master switch
-    ENABLE_ORTOOLS: bool = _safe_bool("ENABLE_ORTOOLS", False)
+    ENABLE_ORTOOLS: bool = _safe_bool("ENABLE_ORTOOLS", True)
 
     # Criterios de activacion
     ORTOOLS_MIN_PLACES: int = _safe_int("ORTOOLS_MIN_PLACES", 4)
@@ -195,7 +195,7 @@ class Settings(BaseSettings):
     ORTOOLS_HEALTH_CHECK_TTL: int = _safe_int("ORTOOLS_HEALTH_CHECK_TTL", 300)
 
     # A/B Testing
-    ORTOOLS_USER_PERCENTAGE: int = _safe_int("ORTOOLS_USER_PERCENTAGE", 50)
+    ORTOOLS_USER_PERCENTAGE: int = _safe_int("ORTOOLS_USER_PERCENTAGE", 100)
     ORTOOLS_TRACK_PERFORMANCE: bool = _safe_bool("ORTOOLS_TRACK_PERFORMANCE", True)
 
     # Advanced Constraints

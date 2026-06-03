@@ -2880,11 +2880,14 @@ async def generate_multimodal_itinerary_endpoint(request: ItineraryRequest):
                 }
                 
                 optimization_result = await ortools_service.optimize_with_ortools(ortools_request)
-                
+
+                # Si el resultado no tiene 'days', tratar como fallo y dejar caer al legacy
+                if not optimization_result or 'days' not in optimization_result:
+                    raise ValueError("OR-Tools returned result without 'days' key")
+
                 # Marcar que se usó ORTools
-                if optimization_result:
-                    optimization_result['optimization_mode'] = 'ortools_advanced'
-                    optimization_result['decision_factors'] = decision.get('factors', {})
+                optimization_result['optimization_mode'] = 'ortools_advanced'
+                optimization_result['decision_factors'] = decision.get('factors', {})
                     
             except Exception as e:
                 logger.warning(f"⚠️ ORTools falló, usando fallback: {e}")
