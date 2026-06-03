@@ -304,11 +304,12 @@ class City2GraphORToolsService:
                     dist_row.append(0.0)
                     dur_row.append(0.0)
                 else:
-                    # Calcular distancia haversine en km
-                    dist = self._haversine_distance(coordinates[i], coordinates[j])
-                    dist_row.append(dist)
-                    # Estimar tiempo (asumiendo 50 km/h promedio)
-                    dur_row.append(dist / 50.0 * 60.0)  # minutos
+                    # Calcular distancia haversine en km → convertir a metros (OSRM format)
+                    dist_km = self._haversine_distance(coordinates[i], coordinates[j])
+                    dist_m = dist_km * 1000.0  # metros
+                    dist_row.append(dist_m)
+                    # Estimar tiempo (asumiendo 50 km/h) → segundos (OSRM format)
+                    dur_row.append(dist_km / 50.0 * 3600.0)  # segundos
             distances.append(dist_row)
             durations.append(dur_row)
         
