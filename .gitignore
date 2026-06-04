@@ -111,3 +111,6 @@ google_drive_config.json
 # S3 config (mantener template, excluir config con credenciales reales)
 s3_config.json
 # Mantener: s3_config.template.json (template sin credenciales reales)
+
+# Python virtualenv (local only — never commit machine paths)
+venv/
