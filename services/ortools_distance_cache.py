@@ -8,6 +8,7 @@ import logging
 import hashlib
 import json
 import asyncio
+import aiohttp
 from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
@@ -16,6 +17,11 @@ from geopy.distance import geodesic
 import time
 
 from settings import settings
+
+# TODO producción: migrar a instancia OSRM propia cuando superes 1000 requests/día.
+# El servidor público demo no tiene SLA y puede bloquear IPs con tráfico sostenido.
+# Ver: https://github.com/Project-OSRM/osrm-backend
+_OSRM_PUBLIC_URL = "https://router.project-osrm.org"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -214,26 +220,69 @@ class ORToolsDistanceCache:
             else:
                 raise e
     
+    async def _calculate_osrm_table(self, places: List[Dict]) -> List[List[float]]:
+        """
+        Calcular matriz NxN completa con una sola llamada a OSRM /table.
+        Para N lugares: 1 request vs N*(N-1)/2 pairwise calls.
+        """
+        n = len(places)
+        # OSRM espera coordenadas en formato lon,lat (no lat,lon)
+        coords_str = ";".join(f"{p['lon']},{p['lat']}" for p in places)
+        url = f"{_OSRM_PUBLIC_URL}/table/v1/driving/{coords_str}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                params={"annotations": "duration,distance"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                if response.status != 200:
+                    raise Exception(f"OSRM /table HTTP {response.status}")
+
+                data = await response.json()
+
+                if data.get("code") != "Ok":
+                    raise Exception(
+                        f"OSRM /table code={data.get('code')}: {data.get('message', '')}"
+                    )
+
+                # Preferir distances (metros → km); si el servidor no las devuelve
+                # usar durations (segundos) convertidos con velocidad media urbana.
+                if data.get("distances"):
+                    logger.info(f"OSRM /table: {n} lugares en 1 request (distances)")
+                    return [[d / 1000.0 for d in row] for row in data["distances"]]
+                elif data.get("durations"):
+                    logger.info(f"OSRM /table: {n} lugares en 1 request (durations→km)")
+                    avg_speed_kmh = 40.0
+                    return [
+                        [(s / 3600.0) * avg_speed_kmh for s in row]
+                        for row in data["durations"]
+                    ]
+                else:
+                    raise Exception("OSRM /table: respuesta sin distances ni durations")
+
     async def _calculate_osrm_matrix(self, places: List[Dict]) -> List[List[float]]:
-        """Calcular matriz usando OSRM (más precisa para rutas reales)"""
+        """
+        Calcular matriz usando OSRM.
+        Intenta /table (1 request) y cae silenciosamente a pairwise si falla.
+        """
         if not self.has_osrm:
             raise Exception("OSRM service not available")
-        
+
         try:
-            # Usar OSRM service para cálculos reales
-            matrix = []
-            
-            # Paralelizar cálculos si hay muchos lugares
-            if len(places) > 10 and settings.ORTOOLS_ENABLE_PARALLEL_OPTIMIZATION:
-                matrix = await self._calculate_osrm_parallel(places)
-            else:
-                matrix = await self._calculate_osrm_sequential(places)
-            
-            return matrix
-            
+            return await self._calculate_osrm_table(places)
         except Exception as e:
-            logger.error(f"❌ OSRM matrix calculation failed: {e}")
-            raise e
+            logger.warning(f"OSRM /table falló, usando pairwise: {e}")
+
+        # Fallback: pairwise calls (comportamiento original)
+        try:
+            if len(places) > 10 and settings.ORTOOLS_ENABLE_PARALLEL_OPTIMIZATION:
+                return await self._calculate_osrm_parallel(places)
+            else:
+                return await self._calculate_osrm_sequential(places)
+        except Exception as e:
+            logger.error(f"❌ OSRM pairwise también falló: {e}")
+            raise
     
     async def _calculate_osrm_sequential(self, places: List[Dict]) -> List[List[float]]:
         """Cálculo secuencial OSRM"""
