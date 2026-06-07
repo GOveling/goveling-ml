@@ -144,3 +144,45 @@ python test_chile_multicity.py
 # DayPlan:
 { date, places: [{id, name, lat, lng, eta?, etd?}], metrics?: {distance_m?, duration_s?} }
 ```
+
+---
+
+## Pendiente post-alpha
+
+### Activar pipeline DwellStats
+
+La infraestructura está lista en Supabase (tablas `place_dwell_stats` y `category_dwell_stats`,
+función `recompute_dwell_stats()`), pero el pg_cron **nunca fue registrado**.
+Las tablas están vacías — el optimizer cae 100% al hardcoded hasta que haya
+usuarios reales con visitas cerradas en Travel Mode (`exit_confidence = 'confirmed'`).
+
+Cuando haya usuarios reales en Travel Mode, ejecutar en Supabase SQL Editor:
+
+```sql
+SELECT cron.schedule(
+  'recompute-dwell-stats-weekly',
+  '0 3 * * 0',
+  $$ SELECT public.recompute_dwell_stats(); $$
+);
+```
+
+Cambiar a diario cuando se superen 5k visitas/mes:
+
+```sql
+SELECT cron.unschedule('recompute-dwell-stats-weekly');
+SELECT cron.schedule(
+  'recompute-dwell-stats-daily',
+  '0 3 * * *',
+  $$ SELECT public.recompute_dwell_stats(); $$
+);
+```
+
+La función es idempotente — safe correrla manualmente en cualquier momento:
+```sql
+SELECT public.recompute_dwell_stats();
+```
+
+**Thresholds de activación del optimizer:**
+- Tier 2 (place-level): ≥ 10 visitas confirmadas por `place_id`
+- Tier 3 (category-level): ≥ 30 visitas confirmadas por `(category, geohash5)`
+- Tier 4 (hardcoded): siempre disponible como fallback
