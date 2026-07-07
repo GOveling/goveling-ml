@@ -543,104 +543,106 @@ async def healthz():
 # 🧠 CITY2GRAPH TESTING ENDPOINTS - FASE 1 (PARA VALIDACIÓN)
 # ========================================================================
 
-@app.get("/debug/ortools-test")
-async def debug_ortools_test():
-    """Diagnóstico: llama OR-Tools con 8 lugares (mismo escenario que el endpoint real)"""
-    import traceback
-    try:
-        from services.city2graph_ortools_service import get_ortools_service
-        svc = await get_ortools_service()
-        healthy = await svc.is_healthy()
-        if not healthy:
-            status = svc.get_service_status()
-            return {"healthy": False, "service_status": status}
-        # Simular normalized_places como los produce el endpoint real
-        test_places = [
-            {"id":"1","name":"Plaza de Armas","lat":-33.4372,"lon":-70.6506,"priority":8,"duration_minutes":90,"category":None,"type":None,"rating":None},
-            {"id":"2","name":"Cerro Santa Lucía","lat":-33.4413,"lon":-70.6445,"priority":7,"duration_minutes":60,"category":None,"type":None,"rating":None},
-            {"id":"3","name":"Mercado Central","lat":-33.4283,"lon":-70.6483,"priority":6,"duration_minutes":60,"category":None,"type":None,"rating":None},
-            {"id":"4","name":"Cerro San Cristóbal","lat":-33.4244,"lon":-70.6363,"priority":9,"duration_minutes":120,"category":None,"type":None,"rating":None},
-            {"id":"5","name":"Museo Arte Precolombino","lat":-33.4385,"lon":-70.6512,"priority":5,"duration_minutes":90,"category":None,"type":None,"rating":None},
-            {"id":"6","name":"Barrio Italia","lat":-33.4490,"lon":-70.6270,"priority":7,"duration_minutes":60,"category":None,"type":None,"rating":None},
-            {"id":"7","name":"La Chascona","lat":-33.4277,"lon":-70.6388,"priority":8,"duration_minutes":60,"category":None,"type":None,"rating":None},
-            {"id":"8","name":"Parque Forestal","lat":-33.4361,"lon":-70.6423,"priority":6,"duration_minutes":60,"category":None,"type":None,"rating":None},
-        ]
-        req = {
-            "places": test_places,
-            "start_date": "2026-06-05",
-            "end_date": "2026-06-07",
-            "daily_start_hour": 9,
-            "daily_end_hour": 19,
-            "transport_mode": "TransportMode.driving",
-            "accommodations": [],
-            "preferences": {},
-            "max_walking_distance_km": 15.0,
-            "max_daily_activities": 6,
-        }
-        result = await svc.optimize_with_ortools(req)
-        return {"healthy": True, "result_keys": list(result.keys()), "days_count": len(result.get("days", []))}
-    except Exception as e:
-        return {"error": str(e), "traceback": traceback.format_exc()}
+# Endpoints de debug/validación: solo registrados con DEBUG=true
+if settings.DEBUG:
+    @app.get("/debug/ortools-test")
+    async def debug_ortools_test():
+        """Diagnóstico: llama OR-Tools con 8 lugares (mismo escenario que el endpoint real)"""
+        import traceback
+        try:
+            from services.city2graph_ortools_service import get_ortools_service
+            svc = await get_ortools_service()
+            healthy = await svc.is_healthy()
+            if not healthy:
+                status = svc.get_service_status()
+                return {"healthy": False, "service_status": status}
+            # Simular normalized_places como los produce el endpoint real
+            test_places = [
+                {"id":"1","name":"Plaza de Armas","lat":-33.4372,"lon":-70.6506,"priority":8,"duration_minutes":90,"category":None,"type":None,"rating":None},
+                {"id":"2","name":"Cerro Santa Lucía","lat":-33.4413,"lon":-70.6445,"priority":7,"duration_minutes":60,"category":None,"type":None,"rating":None},
+                {"id":"3","name":"Mercado Central","lat":-33.4283,"lon":-70.6483,"priority":6,"duration_minutes":60,"category":None,"type":None,"rating":None},
+                {"id":"4","name":"Cerro San Cristóbal","lat":-33.4244,"lon":-70.6363,"priority":9,"duration_minutes":120,"category":None,"type":None,"rating":None},
+                {"id":"5","name":"Museo Arte Precolombino","lat":-33.4385,"lon":-70.6512,"priority":5,"duration_minutes":90,"category":None,"type":None,"rating":None},
+                {"id":"6","name":"Barrio Italia","lat":-33.4490,"lon":-70.6270,"priority":7,"duration_minutes":60,"category":None,"type":None,"rating":None},
+                {"id":"7","name":"La Chascona","lat":-33.4277,"lon":-70.6388,"priority":8,"duration_minutes":60,"category":None,"type":None,"rating":None},
+                {"id":"8","name":"Parque Forestal","lat":-33.4361,"lon":-70.6423,"priority":6,"duration_minutes":60,"category":None,"type":None,"rating":None},
+            ]
+            req = {
+                "places": test_places,
+                "start_date": "2026-06-05",
+                "end_date": "2026-06-07",
+                "daily_start_hour": 9,
+                "daily_end_hour": 19,
+                "transport_mode": "TransportMode.driving",
+                "accommodations": [],
+                "preferences": {},
+                "max_walking_distance_km": 15.0,
+                "max_daily_activities": 6,
+            }
+            result = await svc.optimize_with_ortools(req)
+            return {"healthy": True, "result_keys": list(result.keys()), "days_count": len(result.get("days", []))}
+        except Exception as e:
+            return {"error": str(e), "traceback": traceback.format_exc()}
 
-@app.get("/city2graph/config")
-async def get_city2graph_config():
-    """Obtener configuración actual de City2Graph (para debugging)"""
-    return {
-        "enabled": settings.ENABLE_CITY2GRAPH,
-        "min_places": settings.CITY2GRAPH_MIN_PLACES,
-        "min_days": settings.CITY2GRAPH_MIN_DAYS,
-        "complexity_threshold": settings.CITY2GRAPH_COMPLEXITY_THRESHOLD,
-        "enabled_cities": settings.CITY2GRAPH_CITIES.split(",") if settings.CITY2GRAPH_CITIES else [],
-        "timeout_s": settings.CITY2GRAPH_TIMEOUT_S,
-        "fallback_enabled": settings.CITY2GRAPH_FALLBACK_ENABLED,
-        "user_percentage": settings.CITY2GRAPH_USER_PERCENTAGE,
-        "track_decisions": settings.CITY2GRAPH_TRACK_DECISIONS
-    }
-
-@app.post("/city2graph/test-decision")
-async def test_city2graph_decision(request: ItineraryRequest):
-    """
-    🧪 Testing endpoint para probar algoritmo de decisión City2Graph
-    
-    NO AFECTA el sistema productivo - solo retorna qué decisión tomaría
-    """
-    try:
-        decision = await should_use_city2graph(request)
-        
-        # Log para debugging si está habilitado
-        if settings.DEBUG:
-            logger.info(f"🧪 Test decisión City2Graph: {decision['use_city2graph']} (score: {decision['complexity_score']})")
-        
+    @app.get("/city2graph/config")
+    async def get_city2graph_config():
+        """Obtener configuración actual de City2Graph (para debugging)"""
         return {
-            "status": "success",
-            "decision": decision,
-            "request_summary": {
-                "places_count": len(request.places),
-                "trip_days": (request.end_date - request.start_date).days + 1,
-                "start_date": request.start_date.isoformat(),
-                "end_date": request.end_date.isoformat()
-            },
-            "note": "Esta es solo una simulación - no afecta el sistema productivo"
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error en test de decisión: {e}")
-        raise HTTPException(status_code=500, detail=f"Error en algoritmo de decisión: {str(e)}")
-
-@app.get("/city2graph/stats")
-async def get_city2graph_stats():
-    """Estadísticas de uso de City2Graph (placeholder para métricas futuras)"""
-    return {
-        "status": "phase_2",
-        "message": "Dual optimizer architecture implementada con Circuit Breaker",
-        "current_config": {
             "enabled": settings.ENABLE_CITY2GRAPH,
-            "cities_enabled": settings.CITY2GRAPH_CITIES,
+            "min_places": settings.CITY2GRAPH_MIN_PLACES,
+            "min_days": settings.CITY2GRAPH_MIN_DAYS,
             "complexity_threshold": settings.CITY2GRAPH_COMPLEXITY_THRESHOLD,
-            "circuit_breaker_enabled": True
-        },
-        "next_phase": "Integration Testing & Performance Benchmarks"
-    }
+            "enabled_cities": settings.CITY2GRAPH_CITIES.split(",") if settings.CITY2GRAPH_CITIES else [],
+            "timeout_s": settings.CITY2GRAPH_TIMEOUT_S,
+            "fallback_enabled": settings.CITY2GRAPH_FALLBACK_ENABLED,
+            "user_percentage": settings.CITY2GRAPH_USER_PERCENTAGE,
+            "track_decisions": settings.CITY2GRAPH_TRACK_DECISIONS
+        }
+
+    @app.post("/city2graph/test-decision")
+    async def test_city2graph_decision(request: ItineraryRequest):
+        """
+        🧪 Testing endpoint para probar algoritmo de decisión City2Graph
+    
+        NO AFECTA el sistema productivo - solo retorna qué decisión tomaría
+        """
+        try:
+            decision = await should_use_city2graph(request)
+        
+            # Log para debugging si está habilitado
+            if settings.DEBUG:
+                logger.info(f"🧪 Test decisión City2Graph: {decision['use_city2graph']} (score: {decision['complexity_score']})")
+        
+            return {
+                "status": "success",
+                "decision": decision,
+                "request_summary": {
+                    "places_count": len(request.places),
+                    "trip_days": (request.end_date - request.start_date).days + 1,
+                    "start_date": request.start_date.isoformat(),
+                    "end_date": request.end_date.isoformat()
+                },
+                "note": "Esta es solo una simulación - no afecta el sistema productivo"
+            }
+        
+        except Exception as e:
+            logger.error(f"❌ Error en test de decisión: {e}")
+            raise HTTPException(status_code=500, detail=f"Error en algoritmo de decisión: {str(e)}")
+
+    @app.get("/city2graph/stats")
+    async def get_city2graph_stats():
+        """Estadísticas de uso de City2Graph (placeholder para métricas futuras)"""
+        return {
+            "status": "phase_2",
+            "message": "Dual optimizer architecture implementada con Circuit Breaker",
+            "current_config": {
+                "enabled": settings.ENABLE_CITY2GRAPH,
+                "cities_enabled": settings.CITY2GRAPH_CITIES,
+                "complexity_threshold": settings.CITY2GRAPH_COMPLEXITY_THRESHOLD,
+                "circuit_breaker_enabled": True
+            },
+            "next_phase": "Integration Testing & Performance Benchmarks"
+        }
 
 @app.get("/city2graph/circuit-breaker")
 async def get_circuit_breaker_status():
@@ -3697,5 +3699,5 @@ if __name__ == "__main__":
         "api:app",
         host=getattr(settings, 'API_HOST', '0.0.0.0'),
         port=getattr(settings, 'API_PORT', 8000),
-        reload=getattr(settings, 'DEBUG', True)
+        reload=getattr(settings, 'DEBUG', False)
     )
